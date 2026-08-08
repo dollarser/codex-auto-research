@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "goal_id": "breast-cancer-balanced-accuracy-001",
+  "statement": "在不改变 sklearn breast cancer 数据集、固定分层 75/25 切分和 seed=42 评估协议的前提下，使用仅基于训练集选择的分类器配置，最大化测试集 balanced_accuracy；同时以同一评估协议报告 f1、accuracy 和 training_time_s，保证结果可复核、可比较，并把 0.99 作为挑战门槛而非替代完整证据的唯一结论。",
+  "primary_metric": "balanced_accuracy",
+  "direction": "maximize",
+  "secondary_metrics": [
+    "f1",
+    "accuracy",
+    "training_time_s"
+  ],
+  "baseline": {
+    "command": "python train.py",
+    "metrics_file": "baseline_metrics.json",
+    "status": "COMPLETED",
+    "balanced_accuracy": 0.9850104821802935,
+    "f1": 0.9888888888888889,
+    "accuracy": 0.986013986013986,
+    "training_time_s": 0.006853582803159952,
+    "num_samples": 569,
+    "num_features": 30,
+    "test_size": 0.25,
+    "seed": 42,
+    "model": "Pipeline"
+  },
+  "search_space": {
+    "editable_paths": [
+      "train.py algorithm section"
+    ],
+    "candidates": [
+      {
+        "name": "training-only-inner-cv-logistic-regression",
+        "idea": "在固定训练集上用分层交叉验证选择 LogisticRegression 的 C、class_weight 和 solver；最终只在完整训练集拟合一次。",
+        "reason": "延续当前可解释、快速的线性基线，并针对 balanced_accuracy 搜索类别权重和正则化。"
+      },
+      {
+        "name": "training-only-inner-cv-rbf-svc",
+        "idea": "在固定训练集上用分层交叉验证选择 RBF SVC 的 C、gamma 和 class_weight；最终只在完整训练集拟合。",
+        "reason": "乳腺癌表格特征可能存在非线性边界，SVC 是有希望超过线性基线的候选。"
+      },
+      {
+        "name": "training-only-inner-cv-model-selection",
+        "idea": "把 LogisticRegression 与 RBF SVC 纳入同一个训练集内分层交叉验证候选集合，以 balanced_accuracy 选择最终模型。",
+        "reason": "同时覆盖线性和非线性归纳偏置，仍不使用测试标签调参。"
+      }
+    ],
+    "selected_idea": "training-only-inner-cv-model-selection",
+    "selection_reason": "它在不改变外部测试协议的情况下比较最有希望的线性与非线性候选，且可由现有 balanced_accuracy、f1、accuracy、training_time_s 输出验证。",
+    "sealed_paths": [
+      "goal.json",
+      "baseline_metrics.json",
+      "metrics.json",
+      "research history",
+      "dataset and labels",
+      "train/test split and evaluation code"
+    ]
+  },
+  "constraints": {
+    "max_wall_time_s_per_experiment": 180,
+    "max_peak_vram_mb": 0,
+    "test_set_use": "仅用于最终一次模型评估，不得用于选择模型、超参数或分类阈值。",
+    "comparability": "每次候选实验必须输出与 baseline_metrics.json 同名且同定义的 secondary metrics。",
+    "immutability": "不得修改数据、切分、baseline、goal.json 或既有 research 历史；本契约是本轮明确授权新增的研究文件。"
+  },
+  "stopping": {
+    "challenge_threshold": {
+      "metric": "balanced_accuracy",
+      "operator": ">=",
+      "value": 0.99
+    },
+    "plateau_window": 3,
+    "metric_noise_threshold": 0.001,
+    "max_consecutive_failures": 2,
+    "fallback": "若预算内没有达到挑战门槛，报告已验证的最高 balanced_accuracy、全部 secondary metrics、候选配置、失败实验及证据支持的瓶颈。"
+  },
+  "hard_requirements": [
+    {
+      "metric": "balanced_accuracy",
+      "operator": ">=",
+      "value": 0.99
+    }
+  ],
+  "protocol_requirements": [
+    "使用 sklearn.datasets.load_breast_cancer() 原始数据，不做样本、标签或特征篡改。",
+    "固定 train_test_split(test_size=0.25, random_state=42, stratify=y)，不得改变切分或 seed。",
+    "模型选择、超参数搜索和任何阈值决定只能使用训练集；测试集只能在最终候选确定后评估一次。",
+    "primary_metric 必须使用 balanced_accuracy，并从最终 run 的 metrics.json 读取；f1、accuracy、training_time_s 必须按与 baseline 相同的定义输出。",
+    "training_time_s 必须覆盖最终模型 fit 与测试集 predict 的计时范围，并使用同一计时口径比较。",
+    "不得修改 goal.json、baseline_metrics.json、metrics.json 的基线内容或既有 research 历史。"
+  ],
+  "soft_preferences": [
+    "优先选择在 balanced_accuracy 接近时 training_time_s 更低的方案。",
+    "优先保留 f1 和 accuracy 不明显低于 baseline 的方案。",
+    "优先使用可解释、可复现且依赖现有 sklearn 环境的模型。",
+    "将单次固定 holdout 结果视为 benchmark evidence，不外推为临床部署性能。"
+  ],
+  "rejected_requirements": [
+    {
+      "requirement": "把 goal.json 中的 target_metric=0.98 直接作为最终验收标准",
+      "reason": "它低于用户本轮提出的挑战水平，且没有说明为什么能代表业务价值；已改为 balanced_accuracy 最大化并单独记录 0.99 数值门槛。"
+    },
+    {
+      "requirement": "在测试集上反复调参或选择分类阈值",
+      "reason": "会造成测试集泄漏，使 balanced_accuracy 不再是无偏的最终评估证据。"
+    },
+    {
+      "requirement": "用本次 metrics.json 直接验收临床安全性或最低敏感度",
+      "reason": "当前输出没有 recall/sensitivity、specificity、置信区间或外部验证集，无法验证该要求。"
+    },
+    {
+      "requirement": "为了提升 balanced_accuracy 修改数据、切分、baseline 或历史记录",
+      "reason": "会破坏固定 benchmark 的可比性和审计链。"
+    }
+  ],
+  "reasoning_summary": "balanced_accuracy 适合作为本固定二分类 benchmark 的主指标，因为它同时考虑两类召回率，避免 accuracy 在类别不均衡时掩盖少数类错误；但乳腺癌业务通常对漏诊更敏感，当前 metrics.json 缺少敏感度等字段，因此不能把本契约解释为临床安全验收。现有 baseline 的 balanced_accuracy 为 0.9850104821802935，距 0.99 只有小幅差距；单次 25% holdout 的分辨率和方差使该挑战门槛应作为严格、可验证的 benchmark gate，同时保留未达标时的最佳方案与瓶颈报告。为控制泄漏，首选在训练集内做分层交叉验证的线性/非线性模型选择，最后固定候选后只评估一次测试集。"
+}

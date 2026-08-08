@@ -1,0 +1,2 @@
+{"decision": "promote", "event": "LESSON", "idea_id": "iris-accuracy-003", "lesson": "对原始特征加入标准化后的二阶交互项，并融合线性 SVM、RBF-SVM 和随机森林的概率或决策分数，可以互补不同模型的错误模式，从而提高测试集 accuracy。 produced accuracy=0.9473684210526315; decision=promote.", "run_id": "run-iris-accuracy-003-ee71a360", "ts": 1786084914.028736}
+{"decision": "promote", "event": "LESSON", "idea_id": "iris-accuracy-004", "lesson": "Iris 各类别的协方差结构存在可利用的非线性差异；使用带正则化协方差估计的 QDA 能比当前软投票模型更准确地拟合类别边界。 produced accuracy=1.0; decision=promote.", "run_id": "run-iris-accuracy-004-9af258fd", "ts": 1786087128.0113652}

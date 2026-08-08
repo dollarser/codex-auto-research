@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+research/runs/
+research/ledger/
+research/state/
+
+# Generated research runtime artifacts
+**/research/runs/
+**/research/*.log
+**/research/*.lock
+**/research/active_*.json
+**/research/goal_harness.json
+**/research/goal_decision.json
+**/research/goal_decision_error.json
+**/research/goal_contract_error.json

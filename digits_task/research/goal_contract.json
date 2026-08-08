@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "goal_id": "digits-accuracy-001",
+  "statement": "在不可改变的 sklearn digits 固定评估协议上，寻找一个可复现、无测试集泄漏的分类器，使 metrics.json 中的测试集 accuracy 尽可能高；0.99 是本轮最多 5 次实验内的挑战阈值。若未达到该阈值，必须基于已完成实验给出最有证据的方案、失败原因和剩余瓶颈，而不能把阈值未达成改写成成功。该基准结果只代表固定协议下的 Harness 集成质量，不宣称真实业务场景的泛化性能。",
+  "primary_metric": "accuracy",
+  "direction": "maximize",
+  "secondary_metrics": [
+    "training_time_s"
+  ],
+  "baseline": {
+    "source": "baseline_metrics.json",
+    "accuracy": 0.9777777777777777,
+    "protocol": {
+      "dataset": "sklearn.datasets.load_digits",
+      "num_samples": 1797,
+      "num_features": 64,
+      "test_size": 0.25,
+      "seed": 42,
+      "split": "train_test_split with stratify=dataset.target",
+      "metric_source": "metrics.json:accuracy"
+    }
+  },
+  "search_space": {
+    "editable_paths": [
+      "train.py algorithm section"
+    ],
+    "candidate_ideas": [
+      "在固定预处理边界内比较高容量且适合 digits 的核方法超参数",
+      "比较不依赖额外数据的线性或非线性分类器，并以固定测试协议验证",
+      "优先复核已完成 RBF-SVM 结果的参数方向，再选择一个信息增益最高的单一候选"
+    ],
+    "sealed_paths": [
+      "goal.json",
+      "baseline_metrics.json",
+      "research/"
+    ]
+  },
+  "constraints": {
+    "dataset_and_split_immutable": true,
+    "evaluation_protocol_immutable": true,
+    "no_test_set_fit_or_tuning": true,
+    "max_wall_time_s": 120,
+    "max_peak_vram_mb": 0,
+    "one_experiment_per_turn": true,
+    "do_not_wait_for_running_experiment": true,
+    "do_not_modify_baseline_goal_or_research_history": true,
+    "primary_metric_must_be_present_in_metrics_json": true
+  },
+  "stopping": {
+    "challenge_threshold": {
+      "metric": "accuracy",
+      "direction": ">=",
+      "value": 0.99,
+      "scope": "fixed held-out test set"
+    },
+    "plateau_window": 3,
+    "max_consecutive_failures": 2,
+    "metric_noise_threshold": 0.001,
+    "success_condition": "A completed, protocol-valid run reports metrics.json accuracy >= 0.99; training_time_s is also reported for comparison.",
+    "fallback_condition": "After 5 experiments without the threshold, stop and report the best completed valid run, evidence-weighted choice, failed-run causes, and remaining bottleneck."
+  },
+  "hard_requirements": [
+    "Use the fixed sklearn digits dataset and the existing stratified 75/25 split with seed 42.",
+    "Evaluate the primary metric as test-set accuracy from metrics.json and maximize it.",
+    "Do not fit, select, or tune using test-set labels or test-set-derived information.",
+    "Do not modify goal.json, baseline_metrics.json, existing research history, or the evaluation protocol.",
+    "Use no more than 5 experiment runs, at most one newly started run per turn, and do not wait for a run already in RUNNING state.",
+    "Every performance conclusion must come from a completed run with status COMPLETED and a parseable metrics.json.",
+    "If the challenge threshold is missed within the budget, provide the required evidence-based fallback analysis."
+  ],
+  "soft_preferences": [
+    "Prefer lower training_time_s when accuracy is tied or practically indistinguishable.",
+    "Prefer a simple, reproducible model that fits within the existing wall-time and memory constraints.",
+    "Prefer candidates supported by the existing completed-run evidence before exploring unrelated model families."
+  ],
+  "rejected_requirements": [
+    "Treat accuracy >= 0.99 as proof of real-world business performance or generalization beyond this fixed benchmark.",
+    "Treat training_time_s as a hard acceptance gate without an explicit latency SLA.",
+    "Change the split, seed, dataset, baseline, goal.json, or historical research records to improve the score.",
+    "Use test-set performance for repeated hyperparameter selection without acknowledging protocol contamination.",
+    "Declare success from a failed run, an absent metric, or a metric that is not present in metrics.json."
+  ],
+  "reasoning_summary": {
+    "measurability": "accuracy is directly emitted by train.py into metrics.json; training_time_s is emitted as a comparable secondary metric.",
+    "business_relevance": "the stated use is a Harness integration test, so the relevant business question is protocol fidelity and reproducible optimization, not deployment-grade generalization.",
+    "metric_importance": "accuracy is the requested quality outcome; training_time_s captures efficiency but has no supplied SLA and therefore remains secondary.",
+    "leakage_review": "train.py fits only on X_train/y_train and predicts X_test/y_test after the fixed stratified split; no current leakage was found, but future candidates must preserve this boundary.",
+    "evidence_review": "baseline accuracy is 0.9777777777777777; completed historical runs report 0.9800000000000000 to 0.9822222222222222; two failures were environmental or invocation failures and are not model evidence.",
+    "revision_basis": "The original threshold is retained as an explicit challenge threshold and fallback trigger, while the contract separates hard protocol obligations from soft efficiency preferences and prevents benchmark overclaiming."
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "status": "COMPLETED",
+  "accuracy": 0.972027972027972,
+  "balanced_accuracy": 0.9738993710691823,
+  "f1": 0.9775280898876404,
+  "training_time_s": 6.344690333120525,
+  "num_samples": 569,
+  "num_features": 30,
+  "test_size": 0.25,
+  "seed": 42,
+  "model": "GridSearchCV"
+}

@@ -1,0 +1,4 @@
+{
+  "status": "complete",
+  "reason": "本轮研究停止但未通过硬门槛：run-training-only-inner-cv-model-selection-5250c69b 成功完成，balanced_accuracy=0.9850104821802935，f1=0.9888888888888889，accuracy=0.986013986013986，training_time_s=18.963307917118073；主指标与基线持平且低于 0.99。该结果 discard，不 promote；已有多种 Logistic/RBF、权重、阈值和重复分层 CV 变体均未超过 0.9850104821802935，达到 plateau stopping 条件，继续同一研究空间的 replicate 价值不足；无运行错误、协议违规或可定位故障，因此不 repair。research/goal_contract.json 保持不变，最终采用契约规定的 fallback，报告已验证最高结果并明确硬约束未满足。"
+}

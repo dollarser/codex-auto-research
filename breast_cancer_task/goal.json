@@ -1,0 +1,26 @@
+{
+  "goal_id": "breast-cancer-balanced-accuracy-001",
+  "statement": "在固定的 sklearn breast cancer 数据集和评估协议下优化二分类器，使 balanced accuracy 尽可能高，同时保持 F1 和训练时间可接受",
+  "primary_metric": "balanced_accuracy",
+  "direction": "maximize",
+  "secondary_metrics": ["f1", "accuracy", "training_time_s"],
+  "baseline": {
+    "command": "python train.py",
+    "result": "baseline_metrics.json"
+  },
+  "search_space": {
+    "editable_paths": ["train.py algorithm section"],
+    "sealed_paths": ["goal.json", "baseline_metrics.json", "research/"]
+  },
+  "constraints": {
+    "max_wall_time_s": 180,
+    "max_peak_vram_mb": 0
+  },
+  "stopping": {
+    "target_metric": 0.98,
+    "max_experiments": 100,
+    "plateau_window": 3,
+    "max_consecutive_failures": 2,
+    "metric_noise_threshold": 0.001
+  }
+}

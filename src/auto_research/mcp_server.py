@@ -1,0 +1,255 @@
+"""Experiment lifecycle MCP server.
+
+The server exposes only deterministic experiment tools. Research decisions
+remain in Codex Goal; this process owns durable run submission, result
+retrieval, and cancellation.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+from .ledger import read_json, write_json_atomic
+from .config import load_harness_config
+from .models import GoalSpec
+from .runner import ExperimentRunner
+
+
+class ExperimentService:
+    def __init__(self, project_dir: str | Path | None = None):
+        self.project_dir = Path(project_dir or os.environ.get("AUTO_RESEARCH_PROJECT_DIR", ".")).resolve()
+        self.config = load_harness_config(self.project_dir)
+        self.runner = ExperimentRunner(self.project_dir / "research" / "runs", config=self.config)
+        self.submission_lock_path = self.project_dir / "research" / "experiment_submission.lock"
+        self.active_submission_path = self.project_dir / "research" / "active_experiment.json"
+        self.harness_cycle_path = self.project_dir / "research" / "active_harness_cycle.json"
+
+    @contextmanager
+    def _submission_lock(self):
+        self.submission_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.submission_lock_path.touch(exist_ok=True)
+        import fcntl
+        with self.submission_lock_path.open("r+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _active_run_id(self) -> str | None:
+        active: dict[str, Any] = {}
+        if self.active_submission_path.exists():
+            try:
+                parsed = json.loads(self.active_submission_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    active = parsed
+                else:
+                    raise ValueError("active_experiment.json must contain an object")
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                # A truncated marker is recoverable because run.json/events
+                # remain the durable source of truth.
+                self.active_submission_path.unlink(missing_ok=True)
+        active_run_id = active.get("run_id")
+        if isinstance(active_run_id, str):
+            try:
+                if self.runner.get_result(active_run_id) is None:
+                    return active_run_id
+            except (FileNotFoundError, ValueError):
+                # The marker is a recovery hint, not a source of truth. A
+                # truncated/manual marker must not take the MCP server down.
+                pass
+        if active_run_id:
+            self.active_submission_path.unlink(missing_ok=True)
+
+        # Recover the marker if the MCP process died immediately after submit.
+        for run_file in sorted(self.project_dir.joinpath("research", "runs").glob("run-*/run.json")):
+            run = read_json(run_file, {}) or {}
+            if run.get("status") in {"SUBMITTED", "RUNNING"}:
+                return run.get("run_id")
+        return None
+
+    def _release_active(self, run_id: str) -> None:
+        active = read_json(self.active_submission_path, {}) or {}
+        if active.get("run_id") == run_id:
+            self.active_submission_path.unlink(missing_ok=True)
+
+    def _harness_cycle_id(self) -> str | None:
+        """Return a live Harness submission window, if one is published.
+
+        The marker is deliberately file based: the MCP server is a child of
+        App Server and cannot reliably receive controller state as tool
+        arguments. A dead controller's marker is ignored and removed.
+        """
+        marker = read_json(self.harness_cycle_path, {}) or {}
+        cycle_id = marker.get("cycle_id")
+        pid = marker.get("pid")
+        if not isinstance(cycle_id, str) or not cycle_id:
+            self.harness_cycle_path.unlink(missing_ok=True)
+            return None
+        if not isinstance(pid, int) or pid <= 0:
+            self.harness_cycle_path.unlink(missing_ok=True)
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            self.harness_cycle_path.unlink(missing_ok=True)
+            return None
+        except PermissionError:
+            pass
+        return cycle_id
+
+    def _cycle_already_submitted(self, cycle_id: str) -> str | None:
+        for run_file in self.project_dir.joinpath("research", "runs").glob("run-*/run.json"):
+            run = read_json(run_file, {}) or {}
+            if run.get("harness_cycle_id") == cycle_id and isinstance(run.get("run_id"), str):
+                return run["run_id"]
+        return None
+
+    def _worktree(self, value: str) -> Path:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = self.project_dir / candidate
+        candidate = candidate.resolve()
+        try:
+            candidate.relative_to(self.project_dir)
+        except ValueError as exc:
+            raise ValueError("worktree must be inside AUTO_RESEARCH_PROJECT_DIR") from exc
+        if not candidate.is_dir():
+            raise ValueError(f"worktree does not exist: {candidate}")
+        return candidate
+
+    def _goal_contract_snapshot(self) -> dict[str, Any]:
+        contract_path = self.project_dir / "research" / "goal_contract.json"
+        goal_path = self.project_dir / "goal.json"
+        path = contract_path if contract_path.exists() else goal_path
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not data:
+                raise ValueError("goal file must contain a non-empty JSON object")
+            if path == contract_path:
+                if data.get("schema_version") != 1:
+                    raise ValueError("goal_contract.json must declare schema_version=1")
+                if not isinstance(data.get("revision"), int) or data["revision"] < 1:
+                    raise ValueError("goal_contract.json must declare a positive integer revision")
+            goal = GoalSpec.from_dict(data)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid {path.name}; repair the goal contract before starting an experiment: {exc}"
+            ) from exc
+        canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return {
+            "digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "revision": data.get("revision"),
+            "primary_metric": goal.primary_metric,
+            "direction": goal.direction,
+            "hard_requirements": goal.hard_requirements,
+        }
+
+    def start_experiment(
+        self,
+        idea_id: str,
+        worktree: str,
+        command: str,
+        timeout_s: int | None = None,
+        env: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        if not idea_id or not command:
+            raise ValueError("idea_id and command are required")
+        timeout_s = timeout_s or self.config.default_experiment_timeout_s
+        if timeout_s <= 0 or timeout_s > 7 * 24 * 3600:
+            raise ValueError("timeout_s must be between 1 and 604800")
+        resolved = self._worktree(worktree)
+        snapshot = self._goal_contract_snapshot()
+        with self._submission_lock():
+            harness_cycle_id = self._harness_cycle_id()
+            if harness_cycle_id:
+                existing_cycle_run = self._cycle_already_submitted(harness_cycle_id)
+                if existing_cycle_run:
+                    raise RuntimeError(
+                        "one experiment submission is allowed per Harness cycle; "
+                        f"cycle_id={harness_cycle_id} already submitted run_id={existing_cycle_run}. "
+                        "End this turn and wait for the Harness to open the next cycle."
+                    )
+            if self.config.one_active_experiment:
+                active_run_id = self._active_run_id()
+                if active_run_id:
+                    raise RuntimeError(
+                        "one active experiment is allowed per project; "
+                        f"run_id={active_run_id} is not terminal. End this turn and wait for its terminal event."
+                    )
+            run_id = self.runner.submit(
+                idea_id,
+                resolved,
+                command,
+                timeout_s,
+                env,
+                idempotency_key,
+                goal_contract_digest=snapshot.get("digest"),
+                goal_contract_revision=snapshot.get("revision"),
+                hard_requirements_snapshot=snapshot.get("hard_requirements", []),
+                harness_cycle_id=harness_cycle_id,
+            )
+            if self.config.one_active_experiment:
+                write_json_atomic(self.active_submission_path, {"run_id": run_id})
+        return {"run_id": run_id, "status": "RUNNING", "worktree": str(resolved)}
+
+    def get_experiment_result(self, run_id: str) -> dict[str, Any]:
+        if self.config.one_active_experiment:
+            with self._submission_lock():
+                result = self.runner.get_result(run_id)
+                if result is None:
+                    return {"run_id": run_id, "status": "RUNNING"}
+                self._release_active(run_id)
+        else:
+            result = self.runner.get_result(run_id)
+            if result is None:
+                return {"run_id": run_id, "status": "RUNNING"}
+        return result.to_dict()
+
+    def cancel_experiment(self, run_id: str) -> dict[str, Any]:
+        if self.config.one_active_experiment:
+            with self._submission_lock():
+                result = self.runner.cancel(run_id)
+                self._release_active(run_id)
+        else:
+            result = self.runner.cancel(run_id)
+        return result.to_dict()
+
+def main() -> None:
+    try:
+        from fastmcp import FastMCP
+    except ImportError as exc:
+        raise SystemExit("Install MCP support with: uv sync --extra mcp") from exc
+
+    service = ExperimentService()
+    server = FastMCP("auto-research-experiments")
+
+    @server.tool()
+    def start_experiment(idea_id: str, worktree: str, command: str, timeout_s: int | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Persist and start a detached experiment; returns immediately with run_id."""
+        return service.start_experiment(idea_id, worktree, command, timeout_s, idempotency_key=idempotency_key)
+
+    @server.tool()
+    def get_experiment_result(run_id: str) -> dict[str, Any]:
+        """Read a terminal result, or return RUNNING if no terminal event exists."""
+        return service.get_experiment_result(run_id)
+
+    @server.tool()
+    def cancel_experiment(run_id: str) -> dict[str, Any]:
+        """Cancel a persisted run and write a terminal cancellation event."""
+        return service.cancel_experiment(run_id)
+
+    server.run()
+
+
+if __name__ == "__main__":
+    main()

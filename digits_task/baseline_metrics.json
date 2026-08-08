@@ -1,0 +1,9 @@
+{
+  "status": "COMPLETED",
+  "accuracy": 0.9777777777777777,
+  "num_samples": 1797,
+  "num_features": 64,
+  "test_size": 0.25,
+  "seed": 42,
+  "model": "Pipeline"
+}

@@ -1,0 +1,9 @@
+{
+  "status": "COMPLETED",
+  "accuracy": 0.9210526315789473,
+  "num_samples": 150,
+  "num_features": 4,
+  "test_size": 0.25,
+  "seed": 42,
+  "model": "LogisticRegression"
+}

@@ -1,0 +1,10 @@
+{
+  "status": "COMPLETED",
+  "accuracy": 0.9822222222222222,
+  "training_time_s": 0.02660654205828905,
+  "num_samples": 1797,
+  "num_features": 64,
+  "test_size": 0.25,
+  "seed": 42,
+  "model": "Pipeline"
+}

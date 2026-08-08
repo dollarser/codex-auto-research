@@ -1,0 +1,26 @@
+{
+  "goal_id": "digits-accuracy-001",
+  "statement": "在 sklearn 内置手写数字 digits 数据集上优化分类器测试集 accuracy",
+  "primary_metric": "accuracy",
+  "direction": "maximize",
+  "secondary_metrics": ["training_time_s"],
+  "baseline": {
+    "command": "python train.py",
+    "result": "baseline_metrics.json"
+  },
+  "search_space": {
+    "editable_paths": ["train.py"],
+    "sealed_paths": ["goal.json", "baseline_metrics.json", "research/"]
+  },
+  "constraints": {
+    "max_wall_time_s": 120,
+    "max_peak_vram_mb": 0
+  },
+  "stopping": {
+    "target_metric": 0.99,
+    "max_experiments": 100,
+    "plateau_window": 3,
+    "max_consecutive_failures": 2,
+    "metric_noise_threshold": 0.001
+  }
+}

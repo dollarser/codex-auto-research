@@ -1,0 +1,6 @@
+[mcp_servers.experiment]
+command = "/Users/dollars/work/Auto Research/.venv/bin/python3"
+args = ["-m", "auto_research.mcp_server"]
+env = { AUTO_RESEARCH_PROJECT_DIR = "/Users/dollars/work/Auto Research/digits_task" }
+startup_timeout_sec = 20
+tool_timeout_sec = 604800
