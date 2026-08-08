@@ -4,19 +4,19 @@ reasoning_effort = "medium"
 sandbox = "danger-full-access"
 approval_policy = "never"
 
-[harness]
-max_cycles = 1000
-reconnect_attempts = 3
-reconnect_backoff_s = 2.0
+[listener]
+auto_wake = true
 app_server_response_timeout_s = 60.0
-app_server_turn_timeout_s = 900.0
-app_server_event_idle_timeout_s = 180.0
+resumed_turn_timeout_s = 14400.0
+bind_recency_s = 600.0
+reconnect_initial_s = 2.0
+reconnect_max_s = 60.0
 event_poll_s = 0.25
 event_grace_s = 30.0
 
 [experiment]
 use_shell = true
 allowed_executables = ["python", "python3"]
-default_timeout_s = 180
+default_timeout_s = 3600
 worker_heartbeat_s = 5.0
 one_active_experiment = true

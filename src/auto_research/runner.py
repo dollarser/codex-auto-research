@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 import re
-import signal
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -14,17 +13,25 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .ledger import read_json, write_json_atomic
-from .config import HarnessConfig, load_harness_config
-from .models import TerminalRunResult
 from .command_policy import command_to_argv
+from .config import ResearchConfig, load_config
+from .ledger import read_json, write_json_atomic
+from .models import TerminalRunResult
 
-TERMINAL_EVENT_NAMES = ("completed.json", "failed.json", "timeout.json", "cancelled.json", "lost.json")
+TERMINAL_EVENT_NAMES = (
+    "completed.json",
+    "failed.json",
+    "timeout.json",
+    "cancelled.json",
+    "lost.json",
+)
 RUN_ID_PATTERN = re.compile(r"^run-[A-Za-z0-9._-]+$")
 
 
 def _safe_id(value: str) -> str:
-    cleaned = "".join(char if char.isalnum() or char in "._-" else "-" for char in value)
+    cleaned = "".join(
+        char if char.isalnum() or char in "._-" else "-" for char in value
+    )
     return cleaned.strip(".-")[:120] or "idea"
 
 
@@ -40,6 +47,7 @@ def _terminal_lock(run_dir: Path):
     lock_path.touch(exist_ok=True)
     try:
         import fcntl
+
         with lock_path.open("r+") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
@@ -50,12 +58,17 @@ def _terminal_lock(run_dir: Path):
         yield
 
 
-def finalize_run(run_dir: Path, event_name: str, event: dict[str, Any], run: dict[str, Any]) -> bool:
+def finalize_run(
+    run_dir: Path, event_name: str, event: dict[str, Any], run: dict[str, Any]
+) -> bool:
     """Commit exactly one terminal event and return whether this call won."""
     with _terminal_lock(run_dir):
         if any((run_dir / "events" / name).exists() for name in TERMINAL_EVENT_NAMES):
             return False
-        write_json_atomic(run_dir / "run.json", {**run, "status": event["status"], "return_code": event.get("return_code")})
+        write_json_atomic(
+            run_dir / "run.json",
+            {**run, "status": event["status"], "return_code": event.get("return_code")},
+        )
         write_json_atomic(run_dir / "events" / event_name, event)
         return True
 
@@ -67,7 +80,7 @@ def _run_id(idea_id: str) -> str:
 class ExperimentRunner:
     """Durable detached worker launcher and terminal-result waiter."""
 
-    def __init__(self, runs_dir: str | Path, config: HarnessConfig | None = None):
+    def __init__(self, runs_dir: str | Path, config: ResearchConfig | None = None):
         self.runs_dir = Path(runs_dir)
         self.config = config
         self.runs_dir.mkdir(parents=True, exist_ok=True)
@@ -83,7 +96,8 @@ class ExperimentRunner:
         goal_contract_digest: str | None = None,
         goal_contract_revision: int | None = None,
         hard_requirements_snapshot: list[dict[str, Any]] | None = None,
-        harness_cycle_id: str | None = None,
+        wake_enabled: bool = False,
+        codex_thread_id: str | None = None,
     ) -> str:
         with _terminal_lock(self.runs_dir):
             if idempotency_key:
@@ -91,9 +105,15 @@ class ExperimentRunner:
                     existing = read_json(existing_dir / "run.json", {})
                     if existing.get("idempotency_key") == idempotency_key:
                         return existing["run_id"]
-            config = self.config or load_harness_config(self.runs_dir.parent.parent)
+            config = self.config or load_config(self.runs_dir.parent.parent)
             use_shell = config.use_shell
-            argv = command_to_argv(command, config.allowed_executables) if not use_shell else shlex.split(command) if isinstance(command, str) else list(command)
+            argv = (
+                command_to_argv(command, config.allowed_executables)
+                if not use_shell
+                else shlex.split(command)
+                if isinstance(command, str)
+                else list(command)
+            )
             run_id = _run_id(idea_id)
             run_dir = self.runs_dir / run_id
             events_dir = run_dir / "events"
@@ -102,7 +122,9 @@ class ExperimentRunner:
                 "run_id": run_id,
                 "idea_id": idea_id,
                 "worktree": str(Path(worktree).resolve()),
-                "command": command if isinstance(command, str) else " ".join(shlex.quote(part) for part in argv),
+                "command": command
+                if isinstance(command, str)
+                else " ".join(shlex.quote(part) for part in argv),
                 "argv": argv,
                 "shell": use_shell,
                 "timeout_s": timeout_s,
@@ -111,7 +133,9 @@ class ExperimentRunner:
                 "goal_contract_digest": goal_contract_digest,
                 "goal_contract_revision": goal_contract_revision,
                 "hard_requirements_snapshot": hard_requirements_snapshot or [],
-                "harness_cycle_id": harness_cycle_id,
+                "runtime_version": 3,
+                "wake_enabled": wake_enabled,
+                "codex_thread_id": codex_thread_id,
                 "created_at": time.time(),
                 "status": "SUBMITTED",
                 "worker_heartbeat_s": config.worker_heartbeat_s,
@@ -133,7 +157,9 @@ class ExperimentRunner:
             # to the same environment as the Worker, including its packages.
             interpreter_bin = str(Path(sys.executable).parent)
             current_path = process_env.get("PATH", "")
-            process_env["PATH"] = interpreter_bin + (os.pathsep + current_path if current_path else "")
+            process_env["PATH"] = interpreter_bin + (
+                os.pathsep + current_path if current_path else ""
+            )
             process_env["AUTO_RESEARCH_RUN_ID"] = run_id
             process_env["AUTO_RESEARCH_RUN_DIR"] = str(run_dir)
             process = subprocess.Popen(
@@ -167,7 +193,9 @@ class ExperimentRunner:
                 raise FileNotFoundError(f"Missing run metadata: {run_id}")
             write_json_atomic(run_dir / "run.json", {**run, **metadata})
 
-    def wait(self, run_id: str, poll_s: float | None = None, grace_s: float | None = None) -> TerminalRunResult:
+    def wait(
+        self, run_id: str, poll_s: float | None = None, grace_s: float | None = None
+    ) -> TerminalRunResult:
         """Wait locally on a terminal event; no model or network polling occurs.
 
         Prefer the optional OS-backed watcher when installed. The polling
@@ -186,7 +214,11 @@ class ExperimentRunner:
         if existing:
             return existing
         run = read_json(run_dir / "run.json", {})
-        deadline = float(run.get("created_at", time.time())) + int(run.get("timeout_s", 3600)) + grace_s
+        deadline = (
+            float(run.get("created_at", time.time()))
+            + int(run.get("timeout_s", 3600))
+            + grace_s
+        )
 
         def terminal_or_lost() -> TerminalRunResult | None:
             result = self.get_result(run_id)
@@ -201,21 +233,21 @@ class ExperimentRunner:
         except ImportError:
             watch = None
         if watch is not None:
-            stop_event = threading.Event()
-            timer = threading.Timer(max(0.0, deadline - time.time()), stop_event.set)
-            timer.daemon = True
-            timer.start()
-            try:
-                for _ in watch(str(run_dir / "events"), debounce=250, step=250, stop_event=stop_event):
-                    result = terminal_or_lost()
-                    if result:
-                        return result
-            finally:
-                timer.cancel()
-            result = terminal_or_lost()
-            if result:
-                return result
-            raise RuntimeError(f"Event watcher stopped before run completed: {run_id}")
+            # `yield_on_timeout` closes the race where the terminal file is
+            # created after the preflight check but before the OS watcher is
+            # fully registered. Even without a later file event, the local
+            # timeout tick rechecks durable state and the LOST deadline.
+            for _ in watch(
+                str(run_dir / "events"),
+                debounce=250,
+                step=250,
+                rust_timeout=1000,
+                yield_on_timeout=True,
+            ):
+                result = terminal_or_lost()
+                if result:
+                    return result
+            raise RuntimeError(f"Event watcher stopped unexpectedly: {run_id}")
         while True:
             result = terminal_or_lost()
             if result:
@@ -253,10 +285,13 @@ class ExperimentRunner:
             # The worker holds this same lock while checking the cancellation
             # state and recording child_pid. This closes the startup race where
             # cancellation could happen before the real experiment was spawned.
-            write_json_atomic(run_dir / "cancel.requested.json", {
-                "run_id": run_id,
-                "requested_at": time.time(),
-            })
+            write_json_atomic(
+                run_dir / "cancel.requested.json",
+                {
+                    "run_id": run_id,
+                    "requested_at": time.time(),
+                },
+            )
             run = read_json(run_dir / "run.json", run)
             for key in ("child_pid", "worker_pid"):
                 pid = run.get(key)

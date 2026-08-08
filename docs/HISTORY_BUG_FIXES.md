@@ -1,8 +1,8 @@
-# 历史问题与修复记录
+# v0.1/v0.2 历史问题与修复记录
 
-本文档是当前实现的唯一历史修复索引。设计取舍和已放弃方案见 [HISTORY_DESIGN_ALTERNATIVES.md](HISTORY_DESIGN_ALTERNATIVES.md)。
+本文档记录完整 GoalHarness 在 v0.1/v0.2 中遇到的问题，供历史版本维护和 v0.3 避免回归。当前 v0.3 已删除 `GoalHarness`；现行设计见 [CODEX_AUTO_RESEARCH_AGENT_DESIGN.md](CODEX_AUTO_RESEARCH_AGENT_DESIGN.md)。
 
-## 当前状态
+## 固定历史状态
 
 - Harness 已停止；没有残留的 `goal-harness`、Codex App Server 或实验 MCP 进程。
 - 最近一次 breast-cancer 任务留下 12 个终态实验，最佳主指标为 `0.9850104821802935`。

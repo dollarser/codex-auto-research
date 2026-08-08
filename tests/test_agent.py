@@ -1,76 +1,203 @@
 from __future__ import annotations
 
-import json
 import io
+import json
 import os
+import shlex
 import sys
 import tempfile
+import time
 import unittest
-from types import SimpleNamespace
+from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from auto_research.goal_harness import _event_turn_id, _extract_run_ids, AppServerTimeoutError
-from auto_research.goal_harness import (
-    AppServerClient,
-    DEFAULT_CODEX_MODEL,
-    DEFAULT_CODEX_REASONING_EFFORT,
-)
-from auto_research.config import load_harness_config
-from auto_research.mcp_server import ExperimentService
-from auto_research.models import GoalSpec
-from auto_research.runner import ExperimentRunner, finalize_run
+from auto_research.app_server import AppServerClient
+from auto_research.cli import main as cli_main
+from auto_research.config import load_config
 from auto_research.ledger import write_json_atomic
-from auto_research.mcp_config import register_mcp_config
+from auto_research.mcp_config import register_mcp_config, render_mcp_config
+from auto_research.mcp_server import ExperimentService
+from auto_research.runner import ExperimentRunner, finalize_run
+from auto_research.wake_listener import (
+    GoalBindingError,
+    GoalWakeListener,
+    recover_wake_listeners,
+)
+
+
+def write_goal(project: Path) -> None:
+    write_json_atomic(
+        project / "goal.json",
+        {
+            "goal_id": "goal-test",
+            "statement": "maximize score",
+            "primary_metric": "score",
+            "direction": "maximize",
+            "search_space": {"editable_paths": ["src"], "sealed_paths": ["eval"]},
+            "constraints": {"max_wall_time_s": 60},
+            "hard_requirements": [],
+            "stopping": {"max_experiments": 5},
+        },
+    )
+
+
+def write_terminal_run(project: Path, run_id: str = "run-test-001") -> Path:
+    run_dir = project / "research" / "runs" / run_id
+    (run_dir / "events").mkdir(parents=True)
+    run = {
+        "run_id": run_id,
+        "idea_id": "idea-test",
+        "worktree": str(project),
+        "command": "python train.py",
+        "argv": ["python", "train.py"],
+        "timeout_s": 60,
+        "created_at": time.time(),
+        "status": "RUNNING",
+    }
+    write_json_atomic(run_dir / "run.json", run)
+    write_json_atomic(run_dir / "metrics.json", {"score": 0.9})
+    finalize_run(
+        run_dir,
+        "completed.json",
+        {
+            "event": "RUN_COMPLETED",
+            "run_id": run_id,
+            "idea_id": "idea-test",
+            "status": "COMPLETED",
+            "return_code": 0,
+            "finished_at": time.time(),
+        },
+        run,
+    )
+    return run_dir
+
+
+class FakeAppServer:
+    def __init__(
+        self,
+        *,
+        goal_status: str = "paused",
+        thread_status: str = "idle",
+        threads: list[dict] | None = None,
+        goals: dict[str, dict] | None = None,
+    ):
+        self.goal_status = goal_status
+        self.thread_status = thread_status
+        self.threads = threads or []
+        self.goals = goals or {}
+        self.calls: list[tuple] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def initialize(self):
+        self.calls.append(("initialize",))
+
+    def close(self):
+        self.calls.append(("close",))
+
+    def list_threads(self):
+        return self.threads
+
+    def get_goal(self, thread_id):
+        return self.goals.get(
+            thread_id, {"threadId": thread_id, "status": self.goal_status}
+        )
+
+    def resume_thread(self, thread_id):
+        self.calls.append(("resume", thread_id))
+        return {"id": thread_id, "status": {"type": self.thread_status}}
+
+    def read_thread(self, thread_id):
+        return {"id": thread_id, "status": {"type": self.thread_status}}
+
+    def set_goal_status(self, thread_id, status):
+        self.calls.append(("goal", thread_id, status))
+        self.goal_status = status
+        return {"threadId": thread_id, "status": status}
+
+    def start_turn(self, thread_id, prompt):
+        self.calls.append(("turn", thread_id, prompt))
+        return "turn-wake-1"
+
+    def wait_until_goal_quiescent(self, thread_id, turn_id):
+        self.calls.append(("wait", thread_id, turn_id))
+        return "paused"
 
 
 class AgentTests(unittest.TestCase):
-    def test_harness_config_file_and_environment_override(self):
+    def test_cli_start_does_not_confuse_subcommand_with_experiment_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            write_goal(project)
+            (project / "research").mkdir(exist_ok=True)
+            (project / "research" / "config.toml").write_text(
+                "[listener]\nauto_wake=false\n",
+                encoding="utf-8",
+            )
+            code = (
+                "import json,os,pathlib; "
+                "pathlib.Path(os.environ['AUTO_RESEARCH_RUN_DIR'],'metrics.json')"
+                ".write_text(json.dumps({'score': 1.0}))"
+            )
+            output = io.StringIO()
+            previous = sys.stdout
+            sys.stdout = output
+            try:
+                exit_code = cli_main(
+                    [
+                        "start",
+                        "--project",
+                        str(project),
+                        "--idea-id",
+                        "cli-smoke",
+                        "--worktree",
+                        str(project),
+                        "--command",
+                        f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+                    ]
+                )
+            finally:
+                sys.stdout = previous
+            payload = json.loads(output.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "RUNNING")
+            result = ExperimentRunner(project / "research" / "runs").wait(
+                payload["run_id"], poll_s=0.02
+            )
+            self.assertEqual(result.status, "COMPLETED")
+
+    def test_config_file_and_environment_override(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "research").mkdir()
-            (root / "research" / "harness.toml").write_text(
-                "[codex]\nmodel = 'file-model'\nreasoning_effort = 'low'\n"
-                "[harness]\nmax_cycles = 7\n[experiment]\nuse_shell = false\n",
+            (root / "research" / "config.toml").write_text(
+                "[codex]\nmodel='file-model'\nreasoning_effort='low'\n"
+                "[listener]\nauto_wake=false\nreconnect_max_s=12\n"
+                "[experiment]\nuse_shell=false\n",
                 encoding="utf-8",
             )
-            old_model = os.environ.get("AUTO_RESEARCH_CODEX_MODEL")
-            old_cycles = os.environ.get("AUTO_RESEARCH_MAX_CYCLES")
+            previous = os.environ.get("AUTO_RESEARCH_CODEX_MODEL")
             os.environ["AUTO_RESEARCH_CODEX_MODEL"] = "env-model"
-            os.environ["AUTO_RESEARCH_MAX_CYCLES"] = "9"
             try:
-                config = load_harness_config(root)
+                config = load_config(root)
             finally:
-                if old_model is None:
+                if previous is None:
                     os.environ.pop("AUTO_RESEARCH_CODEX_MODEL", None)
                 else:
-                    os.environ["AUTO_RESEARCH_CODEX_MODEL"] = old_model
-                if old_cycles is None:
-                    os.environ.pop("AUTO_RESEARCH_MAX_CYCLES", None)
-                else:
-                    os.environ["AUTO_RESEARCH_MAX_CYCLES"] = old_cycles
+                    os.environ["AUTO_RESEARCH_CODEX_MODEL"] = previous
             self.assertEqual(config.codex_model, "env-model")
             self.assertEqual(config.codex_reasoning_effort, "low")
-            self.assertEqual(config.max_cycles, 9)
+            self.assertFalse(config.auto_wake)
             self.assertFalse(config.use_shell)
+            self.assertEqual(config.reconnect_max_s, 12)
 
-    def test_app_server_model_overrides_are_configurable(self):
-        client = AppServerClient.__new__(AppServerClient)
-        client.model = "gpt-test"
-        client.reasoning_effort = "high"
-        self.assertEqual(client._model_overrides(), {"model": "gpt-test", "effort": "high"})
-
-    def test_app_server_model_overrides_omit_unset_values(self):
-        client = AppServerClient.__new__(AppServerClient)
-        client.model = None
-        client.reasoning_effort = None
-        self.assertEqual(client._model_overrides(), {})
-
-    def test_harness_defaults_are_pinned(self):
-        self.assertEqual(DEFAULT_CODEX_MODEL, "gpt-5.6-luna")
-        self.assertEqual(DEFAULT_CODEX_REASONING_EFFORT, "medium")
-
-    def test_register_mcp_preserves_other_codex_config(self):
+    def test_register_mcp_preserves_other_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             config = project / ".codex" / "config.toml"
@@ -83,925 +210,282 @@ class AgentTests(unittest.TestCase):
             )
             registered = register_mcp_config(project)
             content = registered.read_text(encoding="utf-8")
-            self.assertIn('[profiles.default]\nmodel = "gpt-test"', content)
-            self.assertIn('[mcp_servers.other]\ncommand = "other"', content)
+            self.assertIn("[mcp_servers.other]", content)
             self.assertIn("auto_research.mcp_server", content)
             self.assertEqual(content.count("[mcp_servers.experiment]"), 1)
 
-    def test_render_mcp_config_preserves_virtualenv_entrypoint(self):
-        from auto_research.mcp_config import render_mcp_config
-
+    def test_render_mcp_uses_virtualenv_entrypoint(self):
         rendered = render_mcp_config(".", "/tmp/project/.venv/bin/python")
         self.assertIn('command = "/tmp/project/.venv/bin/python"', rendered)
 
-    def test_extract_run_id_from_mcp_notification(self):
-        notification = {
-            "method": "item/completed",
-            "params": {
-                "item": {
-                    "type": "mcpToolCall",
-                    "result": {
-                        "structuredContent": {
-                            "run_id": "run-test-001",
-                            "status": "RUNNING",
-                        }
-                    },
-                }
-            },
-        }
-        self.assertEqual(_extract_run_ids(notification), {"run-test-001"})
-
-    def test_event_turn_id_filters_replayed_history(self):
-        historical = {
-            "method": "item/completed",
-            "params": {"threadId": "thread-1", "turnId": "turn-old", "item": {
-                "type": "mcpToolCall", "result": {"structuredContent": {"run_id": "run-old"}}
-            }},
-        }
-        current = {
-            "method": "item/completed",
-            "params": {"threadId": "thread-1", "turnId": "turn-new", "item": {
-                "type": "mcpToolCall", "result": {"structuredContent": {"run_id": "run-new"}}
-            }},
-        }
-        self.assertEqual(_event_turn_id(historical), "turn-old")
-        self.assertEqual(_event_turn_id(current), "turn-new")
-        self.assertNotEqual(_event_turn_id(historical), "turn-new")
-
-    def test_app_server_client_ignores_previous_turn_mcp_items(self):
-        from auto_research.goal_harness import AppServerClient
-
-        stream = io.StringIO("\n".join([
-            json.dumps({"id": 1, "result": {"turn": {"id": "turn-new"}}}),
-            json.dumps({"method": "item/completed", "params": {"turnId": "turn-old", "item": {
-                "type": "mcpToolCall", "result": {"structuredContent": {"run_id": "run-old"}}
-            }}}),
-            json.dumps({"method": "item/completed", "params": {"turnId": "turn-new", "item": {
-                "type": "mcpToolCall", "result": {"structuredContent": {"run_id": "run-new"}}
-            }}}),
-            json.dumps({"method": "turn/completed", "params": {"turn": {"id": "turn-old"}}}),
-            json.dumps({"method": "turn/completed", "params": {"turn": {"id": "turn-new"}}}),
-        ]) + "\n")
-        client = AppServerClient.__new__(AppServerClient)
-        client.cwd = "."
-        client.approval_policy = "never"
-        client.sandbox = "danger-full-access"
-        client.model = None
-        client.reasoning_effort = None
-        client.config = SimpleNamespace(app_server_response_timeout_s=60.0, app_server_turn_timeout_s=900.0)
-        client._next_id = 1
-        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
-        started = []
-        client.on_turn_started = started.append
-        self.assertEqual(client.start_turn("thread-1", "continue"), {"run-new"})
-        self.assertEqual(started, ["turn-new"])
-
-    def test_app_server_interrupts_turn_after_durable_run_is_discovered(self):
-        stream = io.StringIO(json.dumps({"id": 1, "result": {"turn": {"id": "turn-new"}}}) + "\n")
-        client = AppServerClient.__new__(AppServerClient)
-        client.cwd = "."
-        client.approval_policy = "never"
-        client.sandbox = "danger-full-access"
-        client.model = None
-        client.reasoning_effort = None
-        client.config = SimpleNamespace(
-            app_server_response_timeout_s=60.0,
-            app_server_turn_timeout_s=900.0,
-            app_server_event_idle_timeout_s=180.0,
-        )
-        client._next_id = 1
-        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
-        client.run_probe = lambda: {"run-new"}
-        lifecycle = []
-        finished = []
-        client.set_goal_status = lambda thread_id, status: lifecycle.append(("goal", thread_id, status))
-        client.interrupt_turn = lambda thread_id, turn_id: lifecycle.append(("turn", thread_id, turn_id))
-        client.on_turn_finished = lambda turn_id, reason: finished.append((turn_id, reason))
-
-        self.assertEqual(client.start_turn("thread-1", "continue"), {"run-new"})
-        self.assertEqual(lifecycle, [
-            ("goal", "thread-1", "paused"),
-            ("turn", "thread-1", "turn-new"),
-        ])
-        self.assertEqual(finished, [("turn-new", "experiment_persisted")])
-        self.assertIsNone(client._active_turn_id)
-
-    def test_app_server_marks_goal_complete_after_durable_decision(self):
-        stream = io.StringIO(json.dumps({"id": 1, "result": {"turn": {"id": "turn-final"}}}) + "\n")
-        client = AppServerClient.__new__(AppServerClient)
-        client.cwd = "."
-        client.approval_policy = "never"
-        client.sandbox = "danger-full-access"
-        client.model = None
-        client.reasoning_effort = None
-        client.config = SimpleNamespace(
-            app_server_response_timeout_s=60.0,
-            app_server_turn_timeout_s=900.0,
-            app_server_event_idle_timeout_s=180.0,
-        )
-        client._next_id = 1
-        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
-        client.completion_probe = lambda: True
-        lifecycle = []
-        client.set_goal_status = lambda thread_id, status: lifecycle.append(("goal", thread_id, status))
-        client.interrupt_turn = lambda thread_id, turn_id: lifecycle.append(("turn", thread_id, turn_id))
-
-        self.assertEqual(client.start_turn("thread-1", "finish"), set())
-        self.assertEqual(lifecycle, [
-            ("goal", "thread-1", "complete"),
-            ("turn", "thread-1", "turn-final"),
-        ])
-
-    def test_app_server_close_pauses_goal_without_active_turn(self):
-        client = AppServerClient.__new__(AppServerClient)
-        client.last_thread_id = "thread-1"
-        client._active_thread_id = None
-        client._active_turn_id = None
-        client._goal_status = "active"
-        lifecycle = []
-        client.set_goal_status = lambda thread_id, status: lifecycle.append((thread_id, status))
-        client.process = SimpleNamespace(
-            poll=lambda: None,
-            terminate=lambda: lifecycle.append(("process", "terminate")),
-            wait=lambda timeout: None,
-        )
-
-        client.close()
-
-        self.assertEqual(lifecycle, [
-            ("thread-1", "paused"),
-            ("process", "terminate"),
-        ])
-
-    def test_goal_objective_update_preserves_paused_status(self):
-        response = {"id": 1, "result": {"goal": {"status": "paused"}}}
-        stdin = io.StringIO()
-        client = AppServerClient.__new__(AppServerClient)
-        client._next_id = 1
-        client._goal_status = "paused"
-        client.config = SimpleNamespace(app_server_response_timeout_s=60.0)
-        client.process = SimpleNamespace(
-            stdin=stdin,
-            stdout=io.StringIO(json.dumps(response) + "\n"),
-        )
-
-        client.set_goal_objective("thread-1", "refined objective")
-
-        request = json.loads(stdin.getvalue())
-        self.assertEqual(request["method"], "thread/goal/set")
-        self.assertEqual(request["params"]["objective"], "refined objective")
-        self.assertNotIn("status", request["params"])
-        self.assertEqual(client._goal_status, "paused")
-
-    def test_app_server_reads_thread_and_goal_state_from_api(self):
-        stream = io.StringIO("\n".join([
-            json.dumps({
-                "method": "thread/status/changed",
-                "params": {"threadId": "thread-1", "status": {"type": "active", "activeFlags": []}},
-            }),
-            json.dumps({
-                "id": 1,
-                "result": {"thread": {
-                    "id": "thread-1",
-                    "status": {"type": "idle"},
-                    "turns": [{"id": "turn-old", "status": "completed", "items": []}],
-                }},
-            }),
-            json.dumps({
-                "id": 2,
-                "result": {"goal": {
-                    "threadId": "thread-1",
-                    "objective": "research",
-                    "status": "paused",
-                }},
-            }),
-        ]) + "\n")
-        stdin = io.StringIO()
-        client = AppServerClient.__new__(AppServerClient)
-        client._next_id = 1
-        client._goal_status = None
-        client.config = SimpleNamespace(app_server_response_timeout_s=60.0)
-        client.process = SimpleNamespace(stdin=stdin, stdout=stream)
-        thread_statuses = []
-        goal_statuses = []
-        client.on_thread_status_changed = thread_statuses.append
-        client.on_goal_status_changed = goal_statuses.append
-
-        thread = client.read_thread("thread-1", include_turns=True)
-        goal = client.get_goal("thread-1")
-
-        requests = [json.loads(line) for line in stdin.getvalue().splitlines()]
-        self.assertEqual([request["method"] for request in requests], ["thread/read", "thread/goal/get"])
-        self.assertEqual(thread["status"]["type"], "idle")
-        self.assertEqual(goal["status"], "paused")
-        self.assertEqual([status["type"] for status in thread_statuses], ["active", "idle"])
-        self.assertEqual(goal_statuses, ["paused"])
-
-    def test_recovered_turn_remains_active_when_first_interrupt_fails(self):
-        client = AppServerClient.__new__(AppServerClient)
-        client.last_turn_id = None
-        client._active_thread_id = None
-        client._active_turn_id = None
-        client.interrupt_turn = lambda thread_id, turn_id: (_ for _ in ()).throw(
-            AppServerTimeoutError("interrupt timed out")
-        )
-
-        with self.assertRaises(AppServerTimeoutError):
-            client.interrupt_recovered_turn("thread-1", "turn-orphan")
-
-        self.assertEqual(client._active_thread_id, "thread-1")
-        self.assertEqual(client._active_turn_id, "turn-orphan")
-
-    def test_goal_harness_reactivates_goal_only_before_next_turn(self):
-        from auto_research.goal_harness import GoalHarness
-
+    def test_experiment_service_starts_worker_and_arms_listener(self):
         with tempfile.TemporaryDirectory() as tmp:
-            harness = GoalHarness(tmp)
-            lifecycle = []
-            client = SimpleNamespace(
-                config=SimpleNamespace(reconnect_attempts=1, reconnect_backoff_s=1.0),
-                set_goal_status=lambda thread_id, status: lifecycle.append(("goal", status)),
-                start_turn=lambda thread_id, prompt: lifecycle.append(("turn", prompt)) or set(),
-            )
+            project = Path(tmp)
+            write_goal(project)
+            launches: list[dict] = []
 
-            self.assertEqual(harness._start_turn_with_reconnect(client, "thread-1", "analyze"), set())
-            self.assertEqual(lifecycle, [("goal", "active"), ("turn", "analyze")])
-
-    def test_goal_harness_reconfirms_pause_before_waiting_for_resumed_run(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            research = root / "research"
-            research.mkdir()
-            (root / "goal.json").write_text(json.dumps({
-                "goal_id": "goal-resume-pause",
-                "statement": "maximize score",
-                "primary_metric": "score",
-            }), encoding="utf-8")
-            (research / "goal_harness.json").write_text(json.dumps({
-                "thread_id": "thread-existing",
-                "pending_run_id": "run-existing",
-            }), encoding="utf-8")
-            lifecycle = []
-            client = SimpleNamespace(
-                model="gpt-test",
-                reasoning_effort="medium",
-                last_thread_id="thread-existing",
-                initialize=lambda: lifecycle.append("initialize"),
-                resume_thread=lambda thread_id: lifecycle.append(("resume", thread_id)),
-                read_thread=lambda thread_id, include_turns=True: lifecycle.append("read") or {
-                    "id": thread_id,
-                    "status": {"type": "idle"},
-                    "turns": [],
-                },
-                get_goal=lambda thread_id: {
-                    "threadId": thread_id,
-                    "objective": "research",
-                    "status": "paused",
-                },
-                set_goal_status=lambda thread_id, status: lifecycle.append(("goal", status)),
-                set_goal_objective=lambda thread_id, objective: lifecycle.append(("objective", objective)),
-                close=lambda: lifecycle.append("close"),
-            )
-            harness = GoalHarness(root)
-
-            def stop_at_wait(state, run_id):
-                lifecycle.append(("wait", run_id))
-                raise RuntimeError("stop after pause assertion")
-
-            harness._consume_pending_result = stop_at_wait
-            with patch("auto_research.goal_harness.AppServerClient", return_value=client):
-                with self.assertRaisesRegex(RuntimeError, "stop after pause assertion"):
-                    harness.run("objective", "prompt", max_cycles=1)
-
-            self.assertLess(
-                lifecycle.index(("goal", "paused")),
-                lifecycle.index("read"),
-            )
-            self.assertLess(
-                lifecycle.index("read"),
-                lifecycle.index(("wait", "run-existing")),
-            )
-
-    def test_goal_harness_reconciles_and_interrupts_orphaned_turn(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            harness = GoalHarness(tmp)
-            state = {}
-            lifecycle = []
-            snapshots = iter([
-                {
-                    "id": "thread-1",
-                    "status": {"type": "active", "activeFlags": []},
-                    "turns": [{"id": "turn-orphan", "status": "inProgress", "items": []}],
-                },
-                {
-                    "id": "thread-1",
-                    "status": {"type": "idle"},
-                    "turns": [{"id": "turn-orphan", "status": "interrupted", "items": []}],
-                },
-            ])
-            client = SimpleNamespace(
-                read_thread=lambda thread_id, include_turns=True: next(snapshots),
-                get_goal=lambda thread_id: {
-                    "threadId": thread_id,
-                    "objective": "research",
-                    "status": "active",
-                    "tokensUsed": 10,
-                    "timeUsedSeconds": 3,
-                },
-                set_goal_status=lambda thread_id, status: lifecycle.append(("goal", status)),
-                interrupt_recovered_turn=lambda thread_id, turn_id: lifecycle.append(("turn", turn_id)),
-            )
-
-            thread, goal = harness._reconcile_codex_state(client, "thread-1", state)
-
-            self.assertEqual(lifecycle, [("goal", "paused"), ("turn", "turn-orphan")])
-            self.assertEqual(thread["status"]["type"], "idle")
-            self.assertEqual(goal["status"], "paused")
-            self.assertEqual(state["reconciled_turn_status"], "interrupted")
-
-    def test_complete_goal_without_valid_decision_gets_repair_turn(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            research = root / "research"
-            research.mkdir()
-            (root / "goal.json").write_text(json.dumps({
-                "goal_id": "goal-complete-repair",
-                "statement": "maximize score",
-                "primary_metric": "score",
-            }), encoding="utf-8")
-            (research / "goal_harness.json").write_text(json.dumps({
-                "thread_id": "thread-existing",
-            }), encoding="utf-8")
-            prompts = []
-
-            def repair_turn(thread_id, prompt):
-                prompts.append(prompt)
-                (research / "goal_decision.json").write_text(json.dumps({
-                    "status": "complete",
-                    "decision": "plateau",
-                    "evidence_run_ids": ["run-example"],
-                    "hard_requirements_passed": False,
-                    "reason": "validated completion",
-                }), encoding="utf-8")
-                return set()
-
-            client = SimpleNamespace(
-                model="gpt-test",
-                reasoning_effort="medium",
-                last_thread_id="thread-existing",
-                config=SimpleNamespace(reconnect_attempts=1, reconnect_backoff_s=1.0),
-                initialize=lambda: None,
-                resume_thread=lambda thread_id: {},
-                read_thread=lambda thread_id, include_turns=True: {
-                    "id": thread_id,
-                    "status": {"type": "idle"},
-                    "turns": [],
-                },
-                get_goal=lambda thread_id: {
-                    "threadId": thread_id,
-                    "objective": "research",
-                    "status": "complete",
-                },
-                set_goal_status=lambda thread_id, status: None,
-                set_goal_objective=lambda thread_id, objective: None,
-                start_turn=repair_turn,
-                close=lambda: None,
-            )
-            harness = GoalHarness(root)
-
-            with patch("auto_research.goal_harness.AppServerClient", return_value=client):
-                state = harness.run("objective", "prompt", max_cycles=1)
-
-            self.assertEqual(state["phase"], "COMPLETED")
-            self.assertEqual(len(prompts), 1)
-            self.assertIn("goal_decision.json", prompts[0])
-            self.assertIn("不要在本 turn 启动实验", prompts[0])
-
-    def test_app_server_stdout_timeout_is_detected(self):
-        read_fd, write_fd = os.pipe()
-        try:
-            client = AppServerClient.__new__(AppServerClient)
-            client.process = SimpleNamespace(stdout=os.fdopen(read_fd, "r"))
-            client._stderr_tail = lambda: ""
-            with self.assertRaises(AppServerTimeoutError):
-                client._readline_with_timeout(0.01, "test turn")
-        finally:
-            os.close(write_fd)
-            try:
-                client.process.stdout.close()
-            except (AttributeError, OSError):
-                pass
-
-    def test_app_server_answers_non_interactive_server_requests(self):
-        stream = io.StringIO("\n".join([
-            json.dumps({"id": 99, "method": "item/commandExecution/requestApproval", "params": {}}),
-            json.dumps({"id": 1, "result": {"turn": {"id": "turn-new"}}}),
-            json.dumps({"method": "turn/completed", "params": {"turn": {"id": "turn-new"}}}),
-        ]) + "\n")
-        stdin = io.StringIO()
-        client = AppServerClient.__new__(AppServerClient)
-        client.cwd = "."
-        client.approval_policy = "never"
-        client.sandbox = "danger-full-access"
-        client.model = None
-        client.reasoning_effort = None
-        client.config = SimpleNamespace(app_server_response_timeout_s=60.0, app_server_turn_timeout_s=900.0)
-        client._next_id = 1
-        client.process = SimpleNamespace(stdin=stdin, stdout=stream)
-        self.assertEqual(client.start_turn("thread-1", "continue"), set())
-        self.assertIn('"decision": "decline"', stdin.getvalue())
-
-    def test_app_server_buffers_turn_events_received_before_start_response(self):
-        stream = io.StringIO("\n".join([
-            json.dumps({"method": "turn/completed", "params": {"turn": {"id": "turn-new"}}}),
-            json.dumps({"id": 1, "result": {"turn": {"id": "turn-new"}}}),
-        ]) + "\n")
-        client = AppServerClient.__new__(AppServerClient)
-        client.cwd = "."
-        client.approval_policy = "never"
-        client.sandbox = "danger-full-access"
-        client.model = None
-        client.reasoning_effort = None
-        client.config = SimpleNamespace(app_server_response_timeout_s=60.0, app_server_turn_timeout_s=900.0)
-        client._next_id = 1
-        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
-        self.assertEqual(client.start_turn("thread-1", "continue"), set())
-
-    def test_app_server_accepts_final_answer_when_turn_completed_is_missing(self):
-        stream = io.StringIO("\n".join([
-            json.dumps({"id": 1, "result": {"turn": {"id": "turn-final"}}}),
-            json.dumps({"method": "item/completed", "params": {"turnId": "turn-final", "item": {
-                "type": "agentMessage", "phase": "final_answer", "text": "done"
-            }}}),
-        ]) + "\n")
-        client = AppServerClient.__new__(AppServerClient)
-        client.cwd = "."
-        client.approval_policy = "never"
-        client.sandbox = "danger-full-access"
-        client.model = None
-        client.reasoning_effort = None
-        client.config = SimpleNamespace(app_server_response_timeout_s=60.0, app_server_turn_timeout_s=900.0)
-        client._next_id = 1
-        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
-        self.assertEqual(client.start_turn("thread-1", "continue"), set())
-
-    def test_app_server_returns_after_durable_start_experiment_result(self):
-        stream = io.StringIO("\n".join([
-            json.dumps({"id": 1, "result": {"turn": {"id": "turn-started"}}}),
-            json.dumps({"method": "item/completed", "params": {"turnId": "turn-started", "item": {
-                "type": "mcpToolCall", "result": {"structuredContent": {
-                    "run_id": "run-test-started", "status": "RUNNING"
-                }}
-            }}}),
-        ]) + "\n")
-        client = AppServerClient.__new__(AppServerClient)
-        client.cwd = "."
-        client.approval_policy = "never"
-        client.sandbox = "danger-full-access"
-        client.model = None
-        client.reasoning_effort = None
-        client.config = SimpleNamespace(app_server_response_timeout_s=60.0, app_server_turn_timeout_s=900.0)
-        client._next_id = 1
-        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
-        self.assertEqual(client.start_turn("thread-1", "start"), {"run-test-started"})
-
-    def test_app_server_returns_when_durable_run_appears_without_mcp_item(self):
-        stream = io.StringIO(json.dumps({"id": 1, "result": {"turn": {"id": "turn-durable"}}}) + "\n")
-        client = AppServerClient.__new__(AppServerClient)
-        client.cwd = "."
-        client.approval_policy = "never"
-        client.sandbox = "danger-full-access"
-        client.model = None
-        client.reasoning_effort = None
-        client.config = SimpleNamespace(app_server_response_timeout_s=60.0, app_server_turn_timeout_s=900.0)
-        client._next_id = 1
-        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
-        client.run_probe = lambda: {"run-durable"}
-        self.assertEqual(client.start_turn("thread-1", "start"), {"run-durable"})
-
-    def test_runner_survives_parent_style_detached_execution(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            run = ExperimentRunner(root / "runs")
-            run_id = run.submit(
-                "idea-test",
-                root,
-                "python -c 'import json,os; from pathlib import Path; Path(os.environ[\"AUTO_RESEARCH_RUN_DIR\"]).joinpath(\"metrics.json\").write_text(json.dumps({\"score\": 1.0}))'",
-                10,
-            )
-            result = run.wait(run_id)
-            self.assertEqual(result.status, "COMPLETED")
-            self.assertEqual(result.metrics["score"], 1.0)
-
-    def test_experiment_service_returns_run_id_and_recovers_result(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            service = ExperimentService(root)
-            response = service.start_experiment(
-                "idea-mcp",
-                ".",
-                "python -c 'import json,os; from pathlib import Path; Path(os.environ[\"AUTO_RESEARCH_RUN_DIR\"]).joinpath(\"metrics.json\").write_text(json.dumps({\"score\": 0.8}))'",
-                10,
-            )
-            self.assertTrue(response["run_id"].startswith("run-idea-mcp-"))
-            service.runner.wait(response["run_id"])
-            result = service.get_experiment_result(response["run_id"])
-            self.assertEqual(result["status"], "COMPLETED")
-            self.assertEqual(result["metrics"]["score"], 0.8)
-
-    def test_experiment_service_can_cancel_long_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            service = ExperimentService(root)
-            response = service.start_experiment("idea-cancel", ".", "python -c 'import time; time.sleep(30)'", 60)
-            result = service.cancel_experiment(response["run_id"])
-            self.assertEqual(result["status"], "CANCELLED")
-            self.assertEqual(service.get_experiment_result(response["run_id"])["status"], "CANCELLED")
-
-    def test_experiment_service_rejects_second_active_experiment(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            service = ExperimentService(root)
-            first = service.start_experiment("idea-first", ".", "python -c 'import time; time.sleep(30)'", 60)
-            try:
-                with self.assertRaisesRegex(RuntimeError, "one active experiment"):
-                    service.start_experiment("idea-second", ".", "python -c 'pass'", 60)
-            finally:
-                service.cancel_experiment(first["run_id"])
-
-    def test_experiment_service_rejects_second_submission_in_same_harness_cycle(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            service = ExperimentService(root)
-            write_json_atomic(service.harness_cycle_path, {
-                "cycle_id": "cycle-test-1",
-                "pid": os.getpid(),
-            })
-            first = service.start_experiment(
-                "idea-cycle-first", ".",
-                "python -c 'import json,os; from pathlib import Path; Path(os.environ[\"AUTO_RESEARCH_RUN_DIR\"]).joinpath(\"metrics.json\").write_text(json.dumps({\"score\": 1.0}))'",
-                10,
-            )
-            service.runner.wait(first["run_id"])
-            service.get_experiment_result(first["run_id"])
-            with self.assertRaisesRegex(RuntimeError, "one experiment submission is allowed per Harness cycle"):
-                service.start_experiment("idea-cycle-second", ".", "python -c 'pass'", 10)
-
-    def test_experiment_service_recovers_from_malformed_active_marker(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "research").mkdir()
-            (root / "research" / "active_experiment.json").write_text("{broken", encoding="utf-8")
-            service = ExperimentService(root)
-            self.assertIsNone(service._active_run_id())
-            self.assertFalse((root / "research" / "active_experiment.json").exists())
-
-    def test_experiment_service_does_not_fallback_from_invalid_contract(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "goal.json").write_text(json.dumps({
-                "goal_id": "goal-input",
-                "statement": "maximize score",
-                "primary_metric": "score",
-            }))
-            (root / "research").mkdir()
-            (root / "research" / "goal_contract.json").write_text("{broken", encoding="utf-8")
-            service = ExperimentService(root)
-            with self.assertRaisesRegex(ValueError, "invalid goal_contract.json"):
-                service.start_experiment("idea-invalid-contract", ".", "python -c 'pass'", 10)
-
-    def test_experiment_persists_goal_contract_snapshot(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "goal.json").write_text(json.dumps({
-                "goal_id": "goal-snapshot",
-                "statement": "maximize ap",
-                "primary_metric": "ap",
-                "hard_requirements": [{"metric": "ap", "operator": ">=", "value": 0.5}],
-            }))
-            service = ExperimentService(root)
-            response = service.start_experiment(
-                "idea-snapshot",
-                ".",
-                "python -c 'import json,os; from pathlib import Path; Path(os.environ[\"AUTO_RESEARCH_RUN_DIR\"]).joinpath(\"metrics.json\").write_text(json.dumps({\"ap\": 0.6}))'",
-                10,
-            )
-            run = service.runner.get_run(response["run_id"])
-            self.assertEqual(run["hard_requirements_snapshot"][0]["value"], 0.5)
-            service.runner.wait(response["run_id"])
-
-    def test_runner_marks_missing_terminal_event_as_lost(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runner = ExperimentRunner(root / "runs")
-            run_dir = root / "runs" / "run-lost"
-            (run_dir / "events").mkdir(parents=True)
-            write_json_atomic(run_dir / "run.json", {
-                "run_id": "run-lost",
-                "idea_id": "idea-lost",
-                "created_at": 0,
-                "timeout_s": 1,
-                "status": "RUNNING",
-            })
-            result = runner.wait("run-lost", grace_s=0)
-            self.assertEqual(result.status, "LOST")
-            self.assertTrue((run_dir / "events/lost.json").exists())
-
-    def test_runner_idempotency_key_returns_existing_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runner = ExperimentRunner(root / "runs")
-            command = "python -c 'import json,os; from pathlib import Path; Path(os.environ[\"AUTO_RESEARCH_RUN_DIR\"]).joinpath(\"metrics.json\").write_text(json.dumps({\"score\": 0.1}))'"
-            first = runner.submit("unsafe/idea", root, command, 10, idempotency_key="goal-idea-hash")
-            second = runner.submit("unsafe/idea", root, command, 10, idempotency_key="goal-idea-hash")
-            self.assertEqual(first, second)
-            result = runner.wait(first)
-            self.assertEqual(result.status, "COMPLETED")
-
-    def test_terminal_finalize_is_single_winner(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            run_dir = root / "run"
-            (run_dir / "events").mkdir(parents=True)
-            run = {"run_id": "run", "idea_id": "idea", "status": "RUNNING"}
-            event = {"event": "RUN_COMPLETED", "run_id": "run", "idea_id": "idea", "status": "COMPLETED"}
-            self.assertTrue(finalize_run(run_dir, "completed.json", event, run))
-            self.assertFalse(finalize_run(run_dir, "lost.json", {**event, "status": "LOST"}, run))
-
-    def test_runner_rejects_non_allowlisted_shell_executable(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runner = ExperimentRunner(root / "runs")
-            old = os.environ.get("AUTO_RESEARCH_USE_SHELL")
-            os.environ["AUTO_RESEARCH_USE_SHELL"] = "false"
-            try:
-                with self.assertRaises(ValueError):
-                    runner.submit("idea-shell", root, "sh -c 'echo unsafe'", 10)
-            finally:
-                if old is None:
-                    os.environ.pop("AUTO_RESEARCH_USE_SHELL", None)
-                else:
-                    os.environ["AUTO_RESEARCH_USE_SHELL"] = old
-
-    def test_runner_rejects_path_traversal_run_id(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            runner = ExperimentRunner(Path(tmp) / "runs")
-            with self.assertRaises(ValueError):
-                runner.get_result("run-../outside")
-
-    def test_runner_rejects_success_without_metrics(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runner = ExperimentRunner(root / "runs")
-            run_id = runner.submit("no-metrics", root, "python -c 'pass'", 10)
-            result = runner.wait(run_id)
-            self.assertEqual(result.status, "FAILED")
-            self.assertIn("metrics.json", result.error)
-
-    def test_runner_exposes_failure_diagnostics_and_venv_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runner = ExperimentRunner(root / "runs")
-            command = "python -c 'import os,sys; print(os.environ[\"PATH\"]); print(\"diagnostic\", file=sys.stderr); sys.exit(7)'"
-            run_id = runner.submit("diagnostics", root, command, 10)
-            result = runner.wait(run_id)
-            self.assertEqual(result.status, "FAILED")
-            self.assertEqual(result.return_code, 7)
-            self.assertIn("diagnostic", result.stderr_tail)
-            self.assertTrue(result.argv)
-            self.assertIn(str(Path(sys.executable).parent), result.stdout_tail)
-
-    def test_goal_harness_leaves_goal_completion_to_codex(self):
-        from auto_research.goal_harness import GoalHarness
-
-        goal = GoalSpec(
-            goal_id="goal-plateau",
-            statement="maximize accuracy",
-            primary_metric="accuracy",
-            plateau_window=3,
-            metric_noise_threshold=0.001,
-        )
-        state = {"recent_metrics": [0.8, 0.8005, 0.8], "completed_runs": 3}
-        result = type("Result", (), {"status": "COMPLETED", "metrics": {"accuracy": 0.8}})()
-        self.assertIsNone(GoalHarness._should_stop(state, result, goal))
-
-    def test_goal_harness_reconciles_terminal_pending_run(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "research").mkdir()
-            (root / "goal.json").write_text(json.dumps({
-                "goal_id": "goal-reconcile",
-                "statement": "maximize score",
-                "primary_metric": "score",
-                "stopping": {"max_experiments": 5, "max_consecutive_failures": 2},
-            }), encoding="utf-8")
-            harness = GoalHarness(root)
-            run_id = harness.runner.submit(
-                "idea-reconcile",
-                root,
-                "python -c 'import json,os; from pathlib import Path; Path(os.environ[\"AUTO_RESEARCH_RUN_DIR\"]).joinpath(\"metrics.json\").write_text(json.dumps({\"score\": 0.7}))'",
-                10,
-            )
-            harness.runner.wait(run_id)
-            state = {}
-            result, failures, stop_reason = harness._consume_pending_result(state, run_id)
-            self.assertEqual(result.status, "COMPLETED")
-            self.assertEqual(failures, [])
-            self.assertIsNone(stop_reason)
-            self.assertEqual(state["completed_runs"], 1)
-            self.assertIsNone(state["pending_run_id"])
-
-    def test_goal_harness_allows_one_repair_turn_at_failure_limit(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "research").mkdir()
-            (root / "goal.json").write_text(json.dumps({
-                "goal_id": "goal-repair",
-                "statement": "maximize score",
-                "primary_metric": "score",
-                "stopping": {"max_experiments": 10, "max_consecutive_failures": 2},
-            }), encoding="utf-8")
-            harness = GoalHarness(root)
-            state = {}
-            for index in range(2):
-                run_id = harness.runner.submit(
-                    f"failed-{index}", root,
-                    "python -c 'import sys; print(\"broken\", file=sys.stderr); sys.exit(1)'",
-                    10,
+            def launcher(project_dir, run_id, *, thread_id=None):
+                launches.append(
+                    {
+                        "project": str(project_dir),
+                        "run_id": run_id,
+                        "thread_id": thread_id,
+                    }
                 )
-                harness.runner.wait(run_id)
-                _, _, stop_reason = harness._consume_pending_result(state, run_id)
-                self.assertIsNone(stop_reason)
-            self.assertTrue(state["failure_repair_attempted"])
-            state["repair_turn_consumed"] = True
-            run_id = harness.runner.submit(
-                "failed-repair", root,
-                "python -c 'import sys; sys.exit(1)'",
-                10,
+                return {"status": "ARMED", "pid": 123, "thread_id": thread_id}
+
+            service = ExperimentService(project, wake_launcher=launcher)
+            code = (
+                "import json,os,pathlib; "
+                "pathlib.Path(os.environ['AUTO_RESEARCH_RUN_DIR'],'metrics.json')"
+                ".write_text(json.dumps({'score': 1.0}))"
             )
-            harness.runner.wait(run_id)
-            _, _, stop_reason = harness._consume_pending_result(state, run_id)
-            self.assertEqual(stop_reason, "max_consecutive_failures reached")
-
-    def test_goal_harness_reconciles_historical_terminal_run_count(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "research").mkdir()
-            harness = GoalHarness(root)
-            run_id = harness.runner.submit(
-                "idea-count",
-                root,
-                "python -c 'import json,os; from pathlib import Path; Path(os.environ[\"AUTO_RESEARCH_RUN_DIR\"]).joinpath(\"metrics.json\").write_text(json.dumps({\"score\": 0.8}))'",
-                10,
+            result = service.start_experiment(
+                "idea-one",
+                ".",
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+                30,
+                thread_id="thread-current",
             )
-            harness.runner.wait(run_id)
-            state = {"completed_runs": 0}
-            harness._reconcile_completed_run_count(state)
-            self.assertEqual(state["completed_runs"], 1)
+            terminal = service.runner.wait(result["run_id"], poll_s=0.02)
+            self.assertEqual(terminal.status, "COMPLETED")
+            self.assertEqual(result["wake_listener"]["status"], "ARMED")
+            self.assertEqual(launches[0]["thread_id"], "thread-current")
+            run = service.runner.get_run(result["run_id"])
+            self.assertEqual(run["runtime_version"], 3)
+            self.assertTrue(run["wake_enabled"])
+            self.assertEqual(run["codex_thread_id"], "thread-current")
 
-    def test_goal_harness_clears_stale_cycle_marker(self):
-        from auto_research.goal_harness import GoalHarness
-
+    def test_idempotency_key_returns_same_run(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            research = root / "research"
-            research.mkdir()
-            marker = research / "active_harness_cycle.json"
-            marker.write_text(json.dumps({"cycle_id": "stale", "pid": 99999999}), encoding="utf-8")
-            GoalHarness(root)._clear_stale_harness_cycle()
-            self.assertFalse(marker.exists())
+            project = Path(tmp)
+            write_goal(project)
+            service = ExperimentService(
+                project,
+                wake_launcher=lambda *args, **kwargs: {"status": "ARMED"},
+            )
+            code = (
+                "import json,os,pathlib; "
+                "pathlib.Path(os.environ['AUTO_RESEARCH_RUN_DIR'],'metrics.json')"
+                ".write_text(json.dumps({'score': 1.0}))"
+            )
+            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+            first = service.start_experiment(
+                "idea-one", ".", command, 30, idempotency_key="same", thread_id="t1"
+            )
+            service.runner.wait(first["run_id"], poll_s=0.02)
+            second = service.start_experiment(
+                "idea-one", ".", command, 30, idempotency_key="same", thread_id="t1"
+            )
+            self.assertEqual(first["run_id"], second["run_id"])
 
-    def test_goal_harness_checks_conditional_hard_requirements(self):
-        from auto_research.goal_harness import GoalHarness
+    def test_finalize_run_commits_only_one_terminal_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-test"
+            (run_dir / "events").mkdir(parents=True)
+            run = {"run_id": "run-test", "idea_id": "idea", "status": "RUNNING"}
+            first = finalize_run(
+                run_dir,
+                "completed.json",
+                {"status": "COMPLETED", "run_id": "run-test"},
+                run,
+            )
+            second = finalize_run(
+                run_dir,
+                "failed.json",
+                {"status": "FAILED", "run_id": "run-test"},
+                run,
+            )
+            self.assertTrue(first)
+            self.assertFalse(second)
 
-        goal = GoalSpec(
-            goal_id="goal-hard-metrics",
-            statement="maximize quality",
-            primary_metric="ap",
-            hard_requirements=[
-                {"metric": "ap", "operator": ">=", "value": 0.5},
-                {"metric": "recall", "operator": ">=", "value": 0.8, "when": {"thr": 0.1}},
-            ],
+    def test_wake_listener_binds_explicit_thread_and_wakes_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            run_dir = write_terminal_run(project)
+            clients: list[FakeAppServer] = []
+
+            def factory():
+                client = FakeAppServer(goal_status="paused", thread_status="idle")
+                clients.append(client)
+                return client
+
+            listener = GoalWakeListener(
+                project,
+                run_dir.name,
+                thread_id="thread-current",
+                client_factory=factory,
+            )
+            state = listener.run()
+            self.assertEqual(state["state"], "WOKEN")
+            self.assertEqual(state["thread_id"], "thread-current")
+            wake_client = clients[-1]
+            self.assertIn(("goal", "thread-current", "active"), wake_client.calls)
+            turn_calls = [call for call in wake_client.calls if call[0] == "turn"]
+            self.assertEqual(len(turn_calls), 1)
+            self.assertIn(run_dir.name, turn_calls[0][2])
+
+            # Durable WOKEN state makes a repeated event/recovery a no-op.
+            again = listener.run()
+            self.assertEqual(again["wake_turn_id"], "turn-wake-1")
+            self.assertEqual(len(clients), 2)
+
+    def test_wake_listener_does_not_duplicate_an_active_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            run_dir = write_terminal_run(project)
+            clients: list[FakeAppServer] = []
+
+            def factory():
+                client = FakeAppServer(goal_status="active", thread_status="active")
+                clients.append(client)
+                return client
+
+            state = GoalWakeListener(
+                project,
+                run_dir.name,
+                thread_id="thread-current",
+                client_factory=factory,
+            ).run()
+            self.assertEqual(state["state"], "SKIPPED")
+            self.assertFalse(any(call[0] == "turn" for call in clients[-1].calls))
+
+    def test_thread_discovery_prefers_recent_active_goal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            run_dir = write_terminal_run(project)
+            now = time.time()
+            client = FakeAppServer(
+                threads=[
+                    {"id": "thread-paused", "updatedAt": now - 5},
+                    {"id": "thread-active", "updatedAt": now - 10},
+                ],
+                goals={
+                    "thread-paused": {"status": "paused"},
+                    "thread-active": {"status": "active"},
+                },
+            )
+            listener = GoalWakeListener(
+                project,
+                run_dir.name,
+                client_factory=lambda: client,
+            )
+            thread_id = listener._discover_thread(client, now)
+            self.assertEqual(thread_id, "thread-active")
+
+    def test_thread_discovery_rejects_ambiguous_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            run_dir = write_terminal_run(project)
+            now = time.time()
+            client = FakeAppServer(
+                threads=[
+                    {"id": "thread-a", "updatedAt": now},
+                    {"id": "thread-b", "updatedAt": now},
+                ],
+                goals={
+                    "thread-a": {"status": "paused"},
+                    "thread-b": {"status": "paused"},
+                },
+            )
+            listener = GoalWakeListener(
+                project, run_dir.name, client_factory=lambda: client
+            )
+            with self.assertRaises(GoalBindingError):
+                listener._discover_thread(client, now)
+
+    def test_recover_wakes_ignores_pre_v3_historical_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            write_terminal_run(project, "run-historical-001")
+            with patch("auto_research.wake_listener.spawn_wake_listener") as spawn:
+                recovered = recover_wake_listeners(project)
+            self.assertEqual(recovered, [])
+            spawn.assert_not_called()
+
+    def test_app_server_list_threads_uses_exact_cwd_filter(self):
+        stdin = io.StringIO()
+        stream = io.StringIO(
+            json.dumps(
+                {
+                    "id": 1,
+                    "result": {"data": [{"id": "thread-1"}], "nextCursor": None},
+                }
+            )
+            + "\n"
         )
-        result = type("Result", (), {
-            "status": "COMPLETED",
-            "metrics": {"metrics": {"ap": 0.56, "recall": 0.75}, "params": {"thr": 0.1}},
-        })()
-        failures = GoalHarness._check_hard_requirements(result, goal)
-        self.assertEqual(failures, ["recall >= 0.8 (actual=0.75)"])
+        client = AppServerClient.__new__(AppServerClient)
+        client.cwd = "/tmp/project"
+        client.config = SimpleNamespace(app_server_response_timeout_s=60.0)
+        client._next_id = 1
+        client._pending = deque()
+        client._stderr = deque()
+        client.process = SimpleNamespace(stdin=stdin, stdout=stream)
+        threads = client.list_threads()
+        request = json.loads(stdin.getvalue())
+        self.assertEqual(threads, [{"id": "thread-1"}])
+        self.assertEqual(request["method"], "thread/list")
+        self.assertEqual(request["params"]["cwd"], "/tmp/project")
 
-    def test_goal_contract_is_active_source_for_hard_requirements(self):
-        from auto_research.goal_harness import GoalHarness
+    def test_app_server_goal_activation_does_not_replace_objective(self):
+        stdin = io.StringIO()
+        stream = io.StringIO(
+            json.dumps({"id": 1, "result": {"goal": {"status": "active"}}}) + "\n"
+        )
+        client = AppServerClient.__new__(AppServerClient)
+        client.cwd = "/tmp/project"
+        client.config = SimpleNamespace(app_server_response_timeout_s=60.0)
+        client._next_id = 1
+        client._pending = deque()
+        client._stderr = deque()
+        client.process = SimpleNamespace(stdin=stdin, stdout=stream)
+        client.set_goal_status("thread-1", "active")
+        request = json.loads(stdin.getvalue())
+        self.assertEqual(
+            request["params"], {"threadId": "thread-1", "status": "active"}
+        )
+        self.assertNotIn("objective", request["params"])
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "goal.json").write_text(json.dumps({
-                "goal_id": "goal-input",
-                "statement": "maximize ap",
-                "primary_metric": "ap",
-                "hard_requirements": [{"metric": "ap", "operator": ">=", "value": 0.5}],
-            }))
-            contract_dir = root / "research"
-            contract_dir.mkdir()
-            (contract_dir / "goal_contract.json").write_text(json.dumps({
-                "schema_version": 1,
-                "revision": 1,
-                "goal_id": "goal-contract",
-                "statement": "maximize ap under validated conditions",
-                "primary_metric": "ap",
-                "hard_requirements": [{"metric": "ap", "operator": ">=", "value": 0.8}],
-            }))
-            harness = GoalHarness(root)
-            self.assertEqual(harness._goal_spec().hard_requirements[0]["value"], 0.8)
-
-    def test_malformed_goal_contract_is_recorded_for_codex_repair(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            research = root / "research"
-            research.mkdir()
-            (research / "goal_contract.json").write_text(
-                '{"schema_version": 1, "revision": 1, "goal_id": "broken", '
-                '"statement": "bad", "primary_metric": "accuracy", '
-                '"hard_requirements": [{"operator": ">=", "value": 0.9}]}',
-                encoding="utf-8",
+    def test_app_server_waits_for_final_item_after_goal_pauses(self):
+        stream = io.StringIO(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "method": "thread/goal/updated",
+                            "params": {"goal": {"status": "paused"}},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "turnId": "turn-1",
+                                "item": {
+                                    "type": "agentMessage",
+                                    "phase": "final_answer",
+                                },
+                            },
+                        }
+                    ),
+                ]
             )
-            harness = GoalHarness(root)
-            self.assertIsNone(harness._goal_spec())
-            error = json.loads((research / "goal_contract_error.json").read_text(encoding="utf-8"))
-            self.assertIn("goal_contract.json", error["path"])
-            self.assertIn("metric", error["error"])
-
-    def test_malformed_goal_decision_is_recorded_for_codex_repair(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            research = root / "research"
-            research.mkdir()
-            (research / "goal_decision.json").write_text('{"status":"complete"}', encoding="utf-8")
-            harness = GoalHarness(root)
-            self.assertIsNone(harness._read_goal_decision())
-            error = json.loads((research / "goal_decision_error.json").read_text(encoding="utf-8"))
-            self.assertIn("decision", error["error"])
-
-    def test_structured_goal_decision_is_required_and_validated(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            research = root / "research"
-            research.mkdir()
-            decision = {
-                "status": "complete",
-                "decision": "plateau",
-                "evidence_run_ids": ["run-example"],
-                "hard_requirements_passed": False,
-                "reason": "No further evidence value",
-            }
-            (research / "goal_decision.json").write_text(json.dumps(decision), encoding="utf-8")
-            harness = GoalHarness(root)
-            self.assertEqual(harness._read_goal_decision(), decision)
-
-            decision["decision"] = "achieved"
-            (research / "goal_decision.json").write_text(json.dumps(decision), encoding="utf-8")
-            self.assertIsNone(harness._read_goal_decision())
-            self.assertIn("hard_requirements_passed", harness._decision_error["error"])
-
-    def test_completed_decision_is_consumed_before_app_server_start(self):
-        from auto_research.goal_harness import GoalHarness
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            research = root / "research"
-            research.mkdir()
-            decision = {
-                "status": "complete",
-                "decision": "plateau",
-                "evidence_run_ids": ["run-example"],
-                "hard_requirements_passed": False,
-                "reason": "No further evidence value",
-            }
-            (research / "goal_decision.json").write_text(json.dumps(decision), encoding="utf-8")
-            harness = GoalHarness(root)
-            with patch("auto_research.goal_harness.AppServerClient") as app_server:
-                state = harness.run("objective", "prompt", fresh_thread=True)
-            app_server.assert_not_called()
-            self.assertEqual(state["phase"], "COMPLETED")
-            self.assertEqual(state["stop_reason"], "plateau")
+            + "\n"
+        )
+        client = AppServerClient.__new__(AppServerClient)
+        client.cwd = "/tmp/project"
+        client.config = SimpleNamespace(
+            app_server_response_timeout_s=60.0,
+            resumed_turn_timeout_s=60.0,
+        )
+        client._next_id = 1
+        client._pending = deque()
+        client._stderr = deque()
+        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
+        self.assertEqual(
+            client.wait_until_goal_quiescent("thread-1", "turn-1"),
+            "paused",
+        )
 
 
 if __name__ == "__main__":

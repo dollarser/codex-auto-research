@@ -30,7 +30,12 @@ def main() -> int:
     if not command:
         raise RuntimeError("run.json does not contain validated argv")
     worktree = run["worktree"]
-    started = {"event": "RUN_STARTED", "run_id": run_id, "idea_id": idea_id, "started_at": time.time()}
+    started = {
+        "event": "RUN_STARTED",
+        "run_id": run_id,
+        "idea_id": idea_id,
+        "started_at": time.time(),
+    }
     _write_event(run_dir, "started.json", started)
 
     heartbeat_stop = threading.Event()
@@ -39,17 +44,23 @@ def main() -> int:
 
     def heartbeat() -> None:
         while not heartbeat_stop.wait(heartbeat_interval_s):
-            write_json_atomic(run_dir / "heartbeat.json", {
-                "run_id": run_id,
-                "worker_pid": os.getpid(),
-                "timestamp": time.time(),
-            })
+            write_json_atomic(
+                run_dir / "heartbeat.json",
+                {
+                    "run_id": run_id,
+                    "worker_pid": os.getpid(),
+                    "timestamp": time.time(),
+                },
+            )
 
-    write_json_atomic(run_dir / "heartbeat.json", {
-        "run_id": run_id,
-        "worker_pid": os.getpid(),
-        "timestamp": time.time(),
-    })
+    write_json_atomic(
+        run_dir / "heartbeat.json",
+        {
+            "run_id": run_id,
+            "worker_pid": os.getpid(),
+            "timestamp": time.time(),
+        },
+    )
     threading.Thread(target=heartbeat, daemon=True).start()
 
     # Cancellation takes the same lock while writing the cancellation event.
@@ -60,7 +71,9 @@ def main() -> int:
         if any((run_dir / "events" / name).exists() for name in TERMINAL_EVENT_NAMES):
             heartbeat_stop.set()
             return 0
-        if (run_dir / "cancel.requested.json").exists() or current.get("status") == "CANCELLED":
+        if (run_dir / "cancel.requested.json").exists() or current.get(
+            "status"
+        ) == "CANCELLED":
             heartbeat_stop.set()
             return 0
         stdout_file = (run_dir / "stdout.log").open("ab")
@@ -92,7 +105,9 @@ def main() -> int:
         finally:
             stdout_file.close()
             stderr_file.close()
-        write_json_atomic(run_dir / "run.json", {**run, "child_pid": child.pid, "status": "RUNNING"})
+        write_json_atomic(
+            run_dir / "run.json", {**run, "child_pid": child.pid, "status": "RUNNING"}
+        )
     try:
         return_code = child.wait(timeout=timeout_s)
         if return_code == 0:
@@ -100,9 +115,13 @@ def main() -> int:
             event_name = "completed.json"
             error = ""
             try:
-                metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+                metrics = json.loads(
+                    (run_dir / "metrics.json").read_text(encoding="utf-8")
+                )
                 if not isinstance(metrics, dict) or not metrics:
-                    raise ValueError("metrics.json must contain a non-empty JSON object")
+                    raise ValueError(
+                        "metrics.json must contain a non-empty JSON object"
+                    )
             except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
                 status = "FAILED"
                 event_name = "failed.json"
@@ -115,14 +134,23 @@ def main() -> int:
         status = "TIMEOUT"
         event_name = "timeout.json"
         error = f"experiment exceeded {timeout_s}s"
+        cleanup_errors: list[str] = []
         try:
             os.killpg(child.pid, signal.SIGTERM)
             child.wait(timeout=10)
-        except Exception:
+        except (
+            ProcessLookupError,
+            PermissionError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            cleanup_errors.append(f"SIGTERM cleanup failed: {exc}")
             try:
                 os.killpg(child.pid, signal.SIGKILL)
-            except Exception:
-                pass
+            except (ProcessLookupError, PermissionError, OSError) as kill_exc:
+                cleanup_errors.append(f"SIGKILL cleanup failed: {kill_exc}")
+        if cleanup_errors:
+            error += "; " + "; ".join(cleanup_errors)
         return_code = None
 
     heartbeat_stop.set()

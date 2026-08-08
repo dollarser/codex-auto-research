@@ -1,3 +1,3 @@
 # TODO
 
-- [ ] 实现 Supervisor/Watchdog 进程：监控 Harness 和 Codex App Server，支持安全重启、断线恢复、活动实验去重、退避和异常隔离。
+- [ ] 为 `recover-wakes` 提供可选的 launchd 安装器，在机器重启后扫描未完成 run；不重新引入研究 Harness 或 cycle 编排。
