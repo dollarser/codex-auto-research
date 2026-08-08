@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 from auto_research.goal_harness import _event_turn_id, _extract_run_ids, AppServerTimeoutError
 from auto_research.goal_harness import (
@@ -154,6 +155,32 @@ class AgentTests(unittest.TestCase):
         client.on_turn_started = started.append
         self.assertEqual(client.start_turn("thread-1", "continue"), {"run-new"})
         self.assertEqual(started, ["turn-new"])
+
+    def test_app_server_interrupts_turn_after_durable_run_is_discovered(self):
+        stream = io.StringIO(json.dumps({"id": 1, "result": {"turn": {"id": "turn-new"}}}) + "\n")
+        client = AppServerClient.__new__(AppServerClient)
+        client.cwd = "."
+        client.approval_policy = "never"
+        client.sandbox = "danger-full-access"
+        client.model = None
+        client.reasoning_effort = None
+        client.config = SimpleNamespace(
+            app_server_response_timeout_s=60.0,
+            app_server_turn_timeout_s=900.0,
+            app_server_event_idle_timeout_s=180.0,
+        )
+        client._next_id = 1
+        client.process = SimpleNamespace(stdin=io.StringIO(), stdout=stream)
+        client.run_probe = lambda: {"run-new"}
+        interrupted = []
+        finished = []
+        client.interrupt_turn = lambda thread_id, turn_id: interrupted.append((thread_id, turn_id))
+        client.on_turn_finished = lambda turn_id, reason: finished.append((turn_id, reason))
+
+        self.assertEqual(client.start_turn("thread-1", "continue"), {"run-new"})
+        self.assertEqual(interrupted, [("thread-1", "turn-new")])
+        self.assertEqual(finished, [("turn-new", "experiment_persisted")])
+        self.assertIsNone(client._active_turn_id)
 
     def test_app_server_stdout_timeout_is_detected(self):
         read_fd, write_fd = os.pipe()
@@ -652,6 +679,28 @@ class AgentTests(unittest.TestCase):
             (research / "goal_decision.json").write_text(json.dumps(decision), encoding="utf-8")
             self.assertIsNone(harness._read_goal_decision())
             self.assertIn("hard_requirements_passed", harness._decision_error["error"])
+
+    def test_completed_decision_is_consumed_before_app_server_start(self):
+        from auto_research.goal_harness import GoalHarness
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            research = root / "research"
+            research.mkdir()
+            decision = {
+                "status": "complete",
+                "decision": "plateau",
+                "evidence_run_ids": ["run-example"],
+                "hard_requirements_passed": False,
+                "reason": "No further evidence value",
+            }
+            (research / "goal_decision.json").write_text(json.dumps(decision), encoding="utf-8")
+            harness = GoalHarness(root)
+            with patch("auto_research.goal_harness.AppServerClient") as app_server:
+                state = harness.run("objective", "prompt", fresh_thread=True)
+            app_server.assert_not_called()
+            self.assertEqual(state["phase"], "COMPLETED")
+            self.assertEqual(state["stop_reason"], "plateau")
 
 
 if __name__ == "__main__":
