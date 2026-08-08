@@ -38,9 +38,24 @@ Local Runner
 
 ## 4. 方案演进
 
+```mermaid
+flowchart LR
+    A["Python Director<br/>+ Codex SDK"] -.->|"主 Agent 不应在 Codex 外"| C
+    B["Agents SDK Director<br/>+ Codex MCP Server"] -.->|"多 Agent 编排过重"| C
+    X["阻塞式<br/>run_experiment_and_wait"] -.->|"长 turn / MCP 超时"| C
+    C["v0.1<br/>完整 GoalHarness"] -->|"研究决策交还 Codex"| D["v0.2<br/>自主 Codex + 完整 Harness"]
+    D -->|"删除 cycle 和强制暂停"| E["v0.3<br/>Codex Goal + one-shot Listener"]
+    Y["start 后人工查询"] -.->|"无法自动恢复"| E
+```
+
+实线表示实际代码版本演进；虚线表示评估过但未作为主版本发布的方案及其经验来源。
+
 | 阶段 | 主调度者 | 实验执行方式 | 当前状态 |
 |---|---|---|---|
 | A | Python Director | Codex SDK + Runner | 仅保留设计记录，代码已删除 |
 | B | Agents SDK Director | Codex MCP Server + Runner | 仅保留设计记录，未作为当前实现 |
-| C | Codex Goal | Experiment MCP + detached Worker + 完整 GoalHarness | v0.1/v0.2，标签保留 |
-| D | Codex Goal | CLI/可选 MCP + detached Worker + one-shot Listener | v0.3 当前默认方案 |
+| C | Harness 与 Codex 分担 | Experiment MCP + detached Worker + 完整 GoalHarness | v0.1，tag `v0.1.0` |
+| D | Codex Goal | Experiment MCP + detached Worker + 完整 GoalHarness | v0.2，tag `v0.2.0` |
+| E | Codex Goal | CLI/可选 MCP + detached Worker + one-shot Listener | v0.3 当前默认方案 |
+
+更完整的职责矩阵和长实验等待方式对比见[当前方案设计的“与历史架构方案对比”](CODEX_AUTO_RESEARCH_AGENT_DESIGN.md#11-与历史架构方案对比)。

@@ -21,25 +21,47 @@ git switch --detach v0.2.0
 
 ## 当前架构
 
-```text
-Codex Goal
-  ├─ 优化研究目标、选择 idea、修改代码
-  ├─ auto-research start / Experiment MCP
-  ├─ 确认 worker 稳定后台运行
-  └─ 主动暂停 Goal
-             │
-             ▼
-detached Worker ──> completed / failed / timeout / cancelled / lost
-             │
-             ▼
-one-shot Goal Wake Listener
-  ├─ 恢复原 thread
-  ├─ paused -> active
-  ├─ turn/start 注入 run_id 和终态路径
-  └─ 保持 App Server 存活，直到 Goal 再次 paused/complete
+```mermaid
+flowchart LR
+    G["Codex Goal<br/>研究与主动暂停"] --> S["CLI / 可选 MCP<br/>启动实验"]
+    S --> W["detached Worker<br/>训练与评估"]
+    S --> L["one-shot Listener<br/>绑定 run/thread"]
+    W --> E["terminal event"]
+    E --> L
+    L --> A["Codex App Server<br/>恢复原 Goal + turn/start"]
+    A --> G
 ```
 
 Listener 不轮询 Codex，也不创建研究 cycle。安装 `watchfiles` 时监听操作系统文件事件；否则只轮询本地终态文件，不调用模型或 MCP。
+
+## 研究闭环
+
+```mermaid
+flowchart TD
+    A["优化目标并总结历史"] --> B["提出并筛选 idea"]
+    B --> C["实现一个候选并启动实验"]
+    C --> D{"Worker 稳定运行?"}
+    D -->|"否"| E["诊断、修复、重启"]
+    E --> C
+    D -->|"是"| F["Codex 主动暂停 Goal"]
+    F --> G["Worker 后台运行<br/>Codex 不运行"]
+    G --> H["终态事件唤醒原 Goal"]
+    H --> I["分析结果并更新 idea"]
+    I --> J{"Goal 达成?"}
+    J -->|"否"| B
+    J -->|"是"| K["完成并记录证据"]
+```
+
+详细组件边界、时序图、状态图以及与历史方案的对比见[当前方案设计](docs/CODEX_AUTO_RESEARCH_AGENT_DESIGN.md)。
+
+## 方案对比摘要
+
+| 方案 | 主研究 Agent | 实验期间模型轮询 | 自动恢复 | 外部流程复杂度 |
+|---|---|---|---|---|
+| Python/Agents SDK Director | 外部 Director | 取决于实现 | 有 | 高 |
+| v0.1/v0.2 完整 GoalHarness | Codex 或 Harness 分担 | 无 | 有 | 高 |
+| `start` 后人工查询 | Codex | 无 | 无 | 低但不能闭环 |
+| v0.3 one-shot Listener | Codex Goal | 无 | 有 | 低 |
 
 ## 安装
 
