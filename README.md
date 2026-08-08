@@ -121,15 +121,15 @@ uv run auto-research register-mcp --project /path/to/experiment-repo
 
 该命令只创建或更新 `[mcp_servers.experiment]`，会保留已有的其他 Codex 配置。注册完成后，在 Codex 中启动一个 Goal。Goal 的实验调用方式如下：
 
-1. Goal 只调用 `start_experiment`，立即得到 `run_id`，随后结束当前 turn；实验继续由 detached worker 在后台运行。
+1. Goal 只调用 `start_experiment`，立即得到 `run_id`；Harness 随即把 Goal 设为 `paused` 并中断当前 turn，实验继续由 detached worker 在后台运行。
 2. `GoalHarness` 监听本地 `completed/failed/timeout/cancelled` 终态事件，不调用 Codex，也不调用 MCP 状态查询。
-3. 事件到达后，Harness 只为同一个 Goal thread 发起一次恢复 turn；该 turn 调用 `get_experiment_result(run_id)`，分析结果并可启动下一轮。
+3. 事件到达后，Harness 恢复同一个 Goal thread，在启动新 turn 的边界把 Goal 重新设为 `active`；该 turn 调用 `get_experiment_result(run_id)`，分析结果并可启动下一轮。
 4. 不允许使用定时器反复启动 turn，也不允许 Codex 反复查询 `RUNNING`。
 5. 需要停止时调用 `cancel_experiment(run_id)`。
 
 Harness 会按 App Server 的 `turn_id` 关联 MCP 事件。恢复历史 thread 时，即使事件流包含旧 turn 的 MCP item，也不会把旧 `run_id` 误认为当前 turn 新启动的实验。App Server 响应默认 60 秒、单个 turn 默认 900 秒超时；超时会尝试 `turn/interrupt`，不盲目重试 `turn/start`，并把状态保存为 `APP_SERVER_STALLED`，避免静默连接无限阻塞。可通过 `AUTO_RESEARCH_APP_SERVER_RESPONSE_TIMEOUT_S` 和 `AUTO_RESEARCH_APP_SERVER_TURN_TIMEOUT_S` 覆盖。
 
-`--fresh-thread` 只用于人工明确替换当前 Codex thread，不用于守护进程重启。正常恢复必须复用 `goal_harness.json.thread_id`。实验 run 或完成决策一旦持久化，Harness 会主动 interrupt 当前 turn 后再进入等待/退出；已有合法完成决策时会在启动 App Server 之前直接返回，避免产生孤立的进行中会话。
+`--fresh-thread` 只用于人工明确替换当前 Codex thread，不用于守护进程重启。正常恢复必须复用 `goal_harness.json.thread_id`。实验 run 一旦持久化，Harness 会先把 Goal 设为 `paused`，再 interrupt 当前 turn；完成决策落盘时则把 Goal 设为 `complete`。关闭 App Server 前还会 best-effort 暂停尚未进入终态的 Goal 并中断 active turn。已有合法完成决策时会在启动 App Server 之前直接返回，避免产生孤立的进行中会话。
 
 也可以单独启动 MCP server：
 
@@ -138,7 +138,7 @@ AUTO_RESEARCH_PROJECT_DIR=/path/to/experiment-repo \
   uv run auto-research mcp-server
 ```
 
-长实验的关键点是 `run_id`、`run.json`、终态事件和日志都落盘于 `research/runs/<run_id>/`。终端、MCP 连接或 Codex 当前 turn 断开不会杀死 worker；恢复后按 `run_id` 查询即可。Goal 的暂停/恢复由 Codex 会话控制；本项目不模拟未公开稳定的 Goal pause/resume API。
+长实验的关键点是 `run_id`、`run.json`、终态事件和日志都落盘于 `research/runs/<run_id>/`。终端、MCP 连接或 Codex 当前 turn 断开不会杀死 worker；恢复后按 `run_id` 查询即可。Harness 使用 App Server 的 `thread/goal/set` 状态协议管理 `active`、`paused` 和 `complete`，并把最近一次已确认状态记录为 `goal_harness.json.goal_status`。Goal 暂停不会终止 detached worker；恢复到带有 `pending_run_id` 的 thread 时会重新确认 paused，不能依赖上一次连接可能未送达的暂停请求。
 
 实验命令成功退出后必须生成非空 JSON 对象 `research/runs/<run_id>/metrics.json`；否则 Runner 将实验标记为 `FAILED`，不会把缺少指标的结果交给 Goal 晋级。
 
