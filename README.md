@@ -140,6 +140,8 @@ AUTO_RESEARCH_PROJECT_DIR=/path/to/experiment-repo \
 
 长实验的关键点是 `run_id`、`run.json`、终态事件和日志都落盘于 `research/runs/<run_id>/`。终端、MCP 连接或 Codex 当前 turn 断开不会杀死 worker；恢复后按 `run_id` 查询即可。Harness 使用 App Server 的 `thread/goal/set` 状态协议管理 `active`、`paused` 和 `complete`，并把最近一次已确认状态记录为 `goal_harness.json.goal_status`。Goal 暂停不会终止 detached worker；恢复到带有 `pending_run_id` 的 thread 时会重新确认 paused，不能依赖上一次连接可能未送达的暂停请求。
 
+`goal_harness.json` 是崩溃恢复快照，不是 Codex 状态的最终事实源。恢复已有 thread 时，Harness 会执行一次 `thread/goal/get` 和 `thread/read(includeTurns=true)`：把 Goal 状态、thread runtime 状态和 in-progress turn 与本地快照对账；发现旧连接遗留的 turn 时，先暂停 active Goal、调用 `turn/interrupt`，再读取一次确认 thread 已回到 idle。存在 `pending_run_id` 时，查询 Goal 后会在读取 thread 和等待实验前重新提交 `paused` 作为恢复栅栏。`blocked`、`usageLimited`、`budgetLimited` 不会被 Harness 自动改回 active；`complete` 但缺少合法本地完成决策时，只允许一个禁止实验的 decision-repair turn 补齐结构化证据。该对账只在启动/恢复边界执行，不会形成 Codex 状态轮询。
+
 实验命令成功退出后必须生成非空 JSON 对象 `research/runs/<run_id>/metrics.json`；否则 Runner 将实验标记为 `FAILED`，不会把缺少指标的结果交给 Goal 晋级。
 
 如果项目有数值门槛，目标优化阶段会把它们确认并写入当前有效的 `research/goal_contract.json` 的 `hard_requirements`，例如 `ap >= 0.50`，或 `thr == 0.1` 时 `recall >= 0.80`。Harness 会逐个实验核验最新 contract 中的门槛并把失败项反馈给 Codex；它不会仅凭门槛通过就判定整个研究目标完成。

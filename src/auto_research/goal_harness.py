@@ -103,6 +103,10 @@ def _exclusive_file_lock(path: Path):
 class AppServerClient:
     """Small JSONL client for the local Codex App Server protocol."""
 
+    QUIESCENT_GOAL_STATUSES = frozenset({
+        "paused", "blocked", "usageLimited", "budgetLimited", "complete",
+    })
+
     def __init__(self, cwd: str | Path, config: HarnessConfig | None = None):
         self.cwd = str(Path(cwd).resolve())
         self.config = config or load_harness_config(self.cwd)
@@ -244,6 +248,37 @@ class AppServerClient:
         self._send_result(request_id, result)
         return True
 
+    def _record_thread_status(self, status: Any) -> None:
+        if not isinstance(status, dict) or not isinstance(status.get("type"), str):
+            return
+        callback = getattr(self, "on_thread_status_changed", None)
+        if callable(callback):
+            callback(status)
+
+    def _record_goal(self, goal: Any) -> dict[str, Any] | None:
+        if not isinstance(goal, dict):
+            return None
+        status = goal.get("status")
+        if isinstance(status, str):
+            self._goal_status = status
+            callback = getattr(self, "on_goal_status_changed", None)
+            if callable(callback):
+                callback(status)
+        return goal
+
+    def _handle_status_notification(self, message: dict[str, Any]) -> bool:
+        method = message.get("method")
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            return False
+        if method == "thread/status/changed":
+            self._record_thread_status(params.get("status"))
+            return True
+        if method == "thread/goal/updated":
+            self._record_goal(params.get("goal"))
+            return True
+        return False
+
     def _read_response(self, request_id: int, timeout_s: float | None = None) -> dict[str, Any]:
         timeout_s = timeout_s or self.config.app_server_response_timeout_s
         if not hasattr(self, "_pending_messages"):
@@ -259,6 +294,8 @@ class AppServerClient:
                 except json.JSONDecodeError as exc:
                     raise AppServerConnectionError(f"Invalid App Server JSONL response: {line[:500]!r}") from exc
             if self._handle_server_request(message):
+                continue
+            if self._handle_status_notification(message):
                 continue
             if message.get("id") == request_id:
                 if "error" in message:
@@ -293,10 +330,15 @@ class AppServerClient:
         self.set_goal(thread_id, objective)
         return thread_id
 
-    def resume_thread(self, thread_id: str) -> None:
+    def resume_thread(self, thread_id: str) -> dict[str, Any]:
         request_id = self._send("thread/resume", {"threadId": thread_id})
-        self._read_response(request_id)
+        response = self._read_response(request_id)
         self.last_thread_id = thread_id
+        thread = response.get("result", {}).get("thread", {})
+        if isinstance(thread, dict):
+            self._record_thread_status(thread.get("status"))
+            return thread
+        return {}
 
     def reconnect(self, thread_id: str) -> None:
         """Recreate the process and attach to an existing persisted thread."""
@@ -323,15 +365,30 @@ class AppServerClient:
             params,
         )
         response = self._read_response(request_id)
-        goal = response.get("result", {}).get("goal", {})
+        goal = self._record_goal(response.get("result", {}).get("goal"))
         effective_status = goal.get("status") if isinstance(goal, dict) else None
         if not isinstance(effective_status, str):
             effective_status = status
         if effective_status is not None:
-            self._goal_status = effective_status
-            callback = getattr(self, "on_goal_status_changed", None)
-            if callable(callback):
-                callback(effective_status)
+            if self._goal_status != effective_status:
+                self._record_goal({"status": effective_status})
+
+    def get_goal(self, thread_id: str) -> dict[str, Any] | None:
+        request_id = self._send("thread/goal/get", {"threadId": thread_id})
+        response = self._read_response(request_id)
+        return self._record_goal(response.get("result", {}).get("goal"))
+
+    def read_thread(self, thread_id: str, *, include_turns: bool = True) -> dict[str, Any]:
+        request_id = self._send(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": include_turns},
+        )
+        response = self._read_response(request_id)
+        thread = response.get("result", {}).get("thread", {})
+        if not isinstance(thread, dict):
+            raise AppServerConnectionError("thread/read response did not contain a thread")
+        self._record_thread_status(thread.get("status"))
+        return thread
 
     def set_goal(self, thread_id: str, objective: str) -> None:
         self.update_goal(thread_id, objective=objective, status="active")
@@ -358,6 +415,14 @@ class AppServerClient:
         """Best-effort interruption for a turn that stopped producing events."""
         request_id = self._send("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
         self._read_response(request_id, timeout_s=min(self.config.app_server_response_timeout_s, 10.0))
+
+    def interrupt_recovered_turn(self, thread_id: str, turn_id: str) -> None:
+        """Interrupt a turn discovered by thread/read, retaining it on failure."""
+        self.last_turn_id = turn_id
+        self._active_thread_id = thread_id
+        self._active_turn_id = turn_id
+        self.interrupt_turn(thread_id, turn_id)
+        self._mark_turn_finished(thread_id, turn_id, "startup_reconciled")
 
     def _mark_turn_finished(self, thread_id: str, turn_id: str, reason: str) -> None:
         if self._active_thread_id == thread_id and self._active_turn_id == turn_id:
@@ -463,6 +528,8 @@ class AppServerClient:
                 raise AppServerTurnTimeout(str(exc), turn_id=active_turn_id) from exc
             if self._handle_server_request(message):
                 continue
+            if self._handle_status_notification(message):
+                continue
             # Only trust MCP tool results. Shell output and model text may
             # mention historical run_ids while inspecting the ledger.
             message_turn_id = _event_turn_id(message)
@@ -503,7 +570,7 @@ class AppServerClient:
                 self._interrupt_active_turn(active_thread_id, active_turn_id, "client_closing")
             # If pausing failed before the interrupt, retry once after the
             # active turn has been stopped and before dropping the transport.
-            if thread_id and getattr(self, "_goal_status", None) not in {"paused", "complete"}:
+            if thread_id and getattr(self, "_goal_status", None) not in self.QUIESCENT_GOAL_STATUSES:
                 self._set_goal_status_best_effort(thread_id, "paused")
             self.process.terminate()
             try:
@@ -645,6 +712,83 @@ class GoalHarness:
                 )
         raise AppServerConnectionError(f"could not recover App Server turn: {last_error}")
 
+    @staticmethod
+    def _in_progress_turn_ids(thread: dict[str, Any]) -> list[str]:
+        turns = thread.get("turns", [])
+        if not isinstance(turns, list):
+            return []
+        return [
+            turn["id"]
+            for turn in turns
+            if isinstance(turn, dict)
+            and turn.get("status") == "inProgress"
+            and isinstance(turn.get("id"), str)
+        ]
+
+    def _reconcile_codex_state(
+        self,
+        client: AppServerClient,
+        thread_id: str,
+        state: dict[str, Any],
+        *,
+        pause_goal: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Refresh API truth and quiesce an orphaned turn before recovery."""
+        goal = client.get_goal(thread_id)
+        if goal is None:
+            raise AppServerConnectionError(f"thread {thread_id} has no Codex Goal")
+        if pause_goal and goal.get("status") in {"active", "paused"}:
+            # Reassert paused even when the query already reports it. This is
+            # the recovery fence before waiting on a durable background run.
+            client.set_goal_status(thread_id, "paused")
+            goal = {**goal, "status": "paused"}
+        thread = client.read_thread(thread_id, include_turns=True)
+
+        active_turn_ids = self._in_progress_turn_ids(thread)
+        if len(active_turn_ids) > 1:
+            raise AppServerConnectionError(
+                f"thread {thread_id} reported multiple in-progress turns: {active_turn_ids}"
+            )
+        state.update({
+            "goal_status": goal.get("status"),
+            "goal_status_checked_at": time.time(),
+            "goal_tokens_used": goal.get("tokensUsed"),
+            "goal_time_used_seconds": goal.get("timeUsedSeconds"),
+            "thread_status_checked_at": time.time(),
+            "reconciled_active_turn_ids": active_turn_ids,
+        })
+        self._save(state)
+
+        if active_turn_ids:
+            # A prior App Server connection disappeared without conclusively
+            # ending its turn. Pause only an active Goal; preserve complete,
+            # blocked and limit statuses while interrupting the orphaned turn.
+            if goal.get("status") == "active":
+                client.set_goal_status(thread_id, "paused")
+                goal = {**goal, "status": "paused"}
+            stale_turn_id = active_turn_ids[0]
+            client.interrupt_recovered_turn(thread_id, stale_turn_id)
+            state.update({
+                "reconciled_turn_id": stale_turn_id,
+                "reconciled_turn_status": "interrupted",
+                "reconciled_turn_finished_at": time.time(),
+            })
+            self._save(state)
+            thread = client.read_thread(thread_id, include_turns=True)
+            remaining = self._in_progress_turn_ids(thread)
+            if remaining:
+                raise AppServerConnectionError(
+                    f"thread {thread_id} still has an in-progress turn after interrupt: {remaining}"
+                )
+
+        status = thread.get("status", {})
+        status_type = status.get("type") if isinstance(status, dict) else None
+        if status_type in {"notLoaded", "systemError", "active"}:
+            raise AppServerConnectionError(
+                f"thread {thread_id} is not quiescent after reconciliation: {status}"
+            )
+        return thread, goal
+
     def _goal_spec(self) -> GoalSpec | None:
         self._goal_error = None
         for path in (
@@ -731,6 +875,14 @@ class GoalHarness:
             "不要在本 turn 启动实验。不要修改 goal.json、goal_contract.json 或历史记录。"
             f"\n当前目标：{objective}\n补充说明：{user_prompt}"
         )
+
+    def _require_goal_decision_repair(self, reason: str) -> None:
+        if self._decision_error is None:
+            self._decision_error = {
+                "path": str(self._goal_decision_path()),
+                "error": reason,
+            }
+            write_json_atomic(self.decision_error_path, self._decision_error)
 
     def _contract_digest(self) -> str:
         path = self._goal_contract_path()
@@ -1078,9 +1230,17 @@ class GoalHarness:
                     "goal_status_changed_at": time.time(),
                 })
                 self._save(state)
+            def persist_thread_status(status: dict[str, Any]) -> None:
+                state.update({
+                    "thread_status": status.get("type"),
+                    "thread_active_flags": status.get("activeFlags", []),
+                    "thread_status_changed_at": time.time(),
+                })
+                self._save(state)
             client.on_turn_started = persist_turn_started
             client.on_turn_finished = persist_turn_finished
             client.on_goal_status_changed = persist_goal_status
+            client.on_thread_status_changed = persist_thread_status
             client.initialize()
             state.update({
                 "codex_model": client.model,
@@ -1089,13 +1249,46 @@ class GoalHarness:
             self._save(state)
             pending_run_id = state.get("pending_run_id")
             thread_id = None if fresh_thread else state.get("thread_id")
+            suspended_goal_status: str | None = None
             if thread_id:
                 client.resume_thread(thread_id)
-                if pending_run_id:
-                    # Never trust a pause request from a previous transport:
-                    # it may have failed after the run became durable. Confirm
-                    # paused before waiting potentially hours for its event.
-                    client.set_goal_status(thread_id, "paused")
+                _, goal_snapshot = self._reconcile_codex_state(
+                    client,
+                    thread_id,
+                    state,
+                    pause_goal=bool(pending_run_id),
+                )
+                reconciled_goal_status = goal_snapshot.get("status")
+                if reconciled_goal_status not in {
+                    "active", "paused", "blocked", "usageLimited", "budgetLimited", "complete",
+                }:
+                    raise AppServerConnectionError(
+                        f"thread {thread_id} returned invalid Goal status: {reconciled_goal_status!r}"
+                    )
+                if reconciled_goal_status == "complete":
+                    suspended_goal_status = reconciled_goal_status
+                    if not pending_run_id:
+                        self._require_goal_decision_repair(
+                            "App Server reports Goal complete but no valid goal_decision.json exists"
+                        )
+                        state.update({
+                            "phase": "GOAL_DECISION_REPAIR",
+                            "stop_reason": None,
+                            "reason": "Codex Goal completion requires a validated local decision",
+                            "goal_decision_error": self._decision_error,
+                        })
+                        self._save(state)
+                        suspended_goal_status = None
+                elif reconciled_goal_status in {"blocked", "usageLimited", "budgetLimited"}:
+                    suspended_goal_status = reconciled_goal_status
+                    if not pending_run_id:
+                        state.update({
+                            "phase": "GOAL_SUSPENDED",
+                            "stop_reason": reconciled_goal_status,
+                            "reason": "Codex Goal is in a non-runnable state; refusing to reactivate it automatically",
+                        })
+                        self._save(state)
+                        return state
                 if state.get("goal_sync_pending"):
                     active_goal = self._goal_spec()
                     if active_goal:
@@ -1121,6 +1314,10 @@ class GoalHarness:
                 current_prompt = self._goal_repair_prompt(objective, prompt)
                 state.update({"phase": "GOAL_REPAIR", "goal_contract_error": self._goal_error})
                 self._save(state)
+            elif self._decision_error:
+                current_prompt = self._goal_decision_repair_prompt(objective, prompt)
+                state.update({"phase": "GOAL_DECISION_REPAIR", "goal_decision_error": self._decision_error})
+                self._save(state)
             elif state.get("phase") == "GOAL_REFINEMENT" or not self._goal_contract_path().exists():
                 current_prompt = self._goal_refinement_prompt(objective, prompt)
             else:
@@ -1129,7 +1326,46 @@ class GoalHarness:
                 self._reconcile_completed_run_count(state)
                 if pending_run_id:
                     result, hard_failures, stop_reason = self._consume_pending_result(state, pending_run_id)
-                    if stop_reason:
+                    repairing_completed_goal = False
+                    if suspended_goal_status:
+                        decision = self._read_goal_decision()
+                        if suspended_goal_status == "complete" and decision:
+                            state.update({
+                                "phase": "COMPLETED",
+                                "stop_reason": decision.get("decision"),
+                                "reason": decision.get("reason", "Codex Goal declared the research complete"),
+                                "pending_run_id": None,
+                            })
+                            self._save(state)
+                            return state
+                        if suspended_goal_status == "complete":
+                            self._require_goal_decision_repair(
+                                "App Server reports Goal complete but no valid goal_decision.json exists"
+                            )
+                            suspended_goal_status = None
+                            repairing_completed_goal = True
+                            current_prompt = self._goal_decision_repair_prompt(objective, prompt)
+                            state.update({
+                                "phase": "GOAL_DECISION_REPAIR",
+                                "stop_reason": None,
+                                "reason": "Codex Goal completion requires a validated local decision",
+                                "goal_decision_error": self._decision_error,
+                                "pending_run_id": None,
+                            })
+                            self._save(state)
+                        else:
+                            state.update({
+                                "phase": "GOAL_SUSPENDED",
+                                "stop_reason": suspended_goal_status,
+                                "reason": (
+                                    f"experiment reached {result.status}, but Codex Goal remains "
+                                    f"{suspended_goal_status}; refusing to reactivate it automatically"
+                                ),
+                                "pending_run_id": None,
+                            })
+                            self._save(state)
+                            return state
+                    if not repairing_completed_goal and stop_reason:
                         state.update({
                             "phase": "STOPPED",
                             "stop_reason": stop_reason,
@@ -1137,21 +1373,22 @@ class GoalHarness:
                         })
                         self._save(state)
                         return state
-                    force_repair = bool(
+                    force_repair = not repairing_completed_goal and bool(
                         state.get("failure_repair_attempted")
                         and not state.get("repair_turn_consumed")
                         and result.status != "COMPLETED"
                     )
-                    current_prompt = (
-                        self._goal_repair_prompt(objective, prompt)
-                        if self._goal_error
-                        else self._result_prompt(
-                            pending_run_id,
-                            hard_failures,
-                            result=result,
-                            force_repair=force_repair,
+                    if not repairing_completed_goal:
+                        current_prompt = (
+                            self._goal_repair_prompt(objective, prompt)
+                            if self._goal_error
+                            else self._result_prompt(
+                                pending_run_id,
+                                hard_failures,
+                                result=result,
+                                force_repair=force_repair,
+                            )
                         )
-                    )
                     if force_repair:
                         state["repair_turn_consumed"] = True
                         self._save(state)

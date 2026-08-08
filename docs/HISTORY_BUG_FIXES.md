@@ -182,6 +182,14 @@ Worker 现在 detached、独立 session、保存 PID/heartbeat；终端、App Se
 
 验证：`test_app_server_interrupts_turn_after_durable_run_is_discovered`、`test_app_server_marks_goal_complete_after_durable_decision`、`test_app_server_close_pauses_goal_without_active_turn`、`test_goal_objective_update_preserves_paused_status`、`test_goal_harness_reactivates_goal_only_before_next_turn`、`test_goal_harness_reconfirms_pause_before_waiting_for_resumed_run`。
 
+### 20. 本地会话快照可能与 App Server 实际状态漂移
+
+问题：Harness 过去只保存 `thread_id`、turn 事件和最后一次 `thread/goal/set` 的响应。用户从桌面端操作、旧 App Server 连接断开或暂停请求未送达后，`goal_harness.json` 可能落后于真实 thread/Goal；恢复时直接按本地状态推进，可能与遗留 in-progress turn 冲突，或错误激活 blocked/limited/complete Goal。
+
+修复：恢复已有 thread 时一次性调用 `thread/goal/get` 和 `thread/read(includeTurns=true)` 对账。`pending_run_id` 存在时先重新提交 paused；发现单个遗留 turn 时暂停 active Goal、interrupt 并复读确认 idle。运行期消费 `thread/status/changed` 和 `thread/goal/updated`，把 API 已确认状态写回本地。多个 active turn、systemError、无法静止或缺失 Goal 被视为显式启动故障；blocked/limited Goal 进入 `GOAL_SUSPENDED`。Goal complete 但缺少合法本地决策时，只启动禁止实验的 decision-repair turn，避免格式错误导致永久停死。
+
+验证：`test_app_server_reads_thread_and_goal_state_from_api`、`test_goal_harness_reconciles_and_interrupts_orphaned_turn`、`test_recovered_turn_remains_active_when_first_interrupt_fails`、`test_goal_harness_reconfirms_pause_before_waiting_for_resumed_run`、`test_complete_goal_without_valid_decision_gets_repair_turn`。
+
 ## 验证标准
 
 ```bash
