@@ -47,6 +47,8 @@ uv run auto-research wait run-... --runs-dir research/runs
 
 当前推荐把 Codex Goal 作为主研究 Agent，把本项目的 MCP server 作为实验执行层。Goal 负责总结目标、提出和筛选 idea、修改可编辑代码、解释结果；MCP server 只负责启动、持久化、查询、等待和取消实验，不参与算法决策。
 
+Harness 不编排固定的算法研究步骤。实验前和实验后，Codex 可以自主决定进行数据/文献分析、环境配置、代码修改、验证、repair、replicate 或目标契约修订；Harness 只提供异步实验运行时、恢复、预算、幂等、sealed 文件和 hard requirement 边界。详细边界见[当前方案设计](docs/CODEX_AUTO_RESEARCH_AGENT_DESIGN.md)的“自主研究边界”。
+
 当前 Goal Harness 通过 `codex app-server --stdio` 连接 Codex，而不是为每轮实验创建独立的 `codex exec` 会话。App Server 维护可恢复的 `thread`；Goal 是 thread 上的持续研究目标；每个 `turn` 是一次独立的推理/工具调用周期。启动长实验的 turn 结束后，Codex 不运行，detached worker 在后台执行；Harness 只监听本地终态事件，事件到达后恢复原 thread 并发起一次新的 turn。Harness 会缓存先于 JSON-RPC 响应到达的生命周期通知，避免 `turn/completed` 被响应读取逻辑丢弃；恢复旧 thread 时也会重新同步并激活当前目标契约。完整的组件边界、RPC 顺序和时序见[当前方案设计](docs/CODEX_AUTO_RESEARCH_AGENT_DESIGN.md)。
 
 首次实验前，Goal Harness 会要求 Codex 主动审查用户目标，并将带有 `schema_version` 和 `revision` 的研究契约写入 `research/goal_contract.json`。实验启动时会把当前 contract 的硬指标快照固化到该 run；实验过程中默认沿用 contract，只有实验反馈明确证明目标、指标或约束明显不合理时，Codex 才应修订它。Harness 只执行实验预算、失败上限、结果格式和硬性资源边界。目标是否达成必须由 Codex 写入 `research/goal_decision.json` 显式判断。

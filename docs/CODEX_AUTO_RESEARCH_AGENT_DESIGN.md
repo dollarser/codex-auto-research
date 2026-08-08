@@ -132,7 +132,7 @@ Codex Goal 是主 Agent。Python 代码不是第二个研究 Agent，只承担�
 
 ## 4. 当前端到端研究流程
 
-一轮完整研究流程如下：
+下面是一条常见研究路径，不是 Harness 强制执行的固定工作流：
 
 1. 用户描述一个可能不完整或不合理的优化目标。
 2. Codex Goal 读取 baseline、评估协议、代码约束、历史 ideas、失败记录和必要的研究证据。
@@ -147,6 +147,19 @@ Codex Goal 是主 Agent。Python 代码不是第二个研究 Agent，只承担�
 11. Codex Goal 根据反馈修订 goal contract：可以删除不重要指标、替换不合理指标或调整研究问题，但必须记录修订理由和证据。
 12. Codex Goal 做出 `promote`、`discard`、`replicate`、`repair` 或 `pause` 决策，更新 ledger 和 state。
 13. Codex Goal 如果判断目标已达成或继续实验没有价值，写入 `research/goal_decision.json`；否则启动下一轮。
+
+### 4.2 自主研究边界
+
+Harness 不要求 Codex 在每个实验前后执行固定步骤，也不替 Codex 选择“先分析、先查论文、先配环境、先改代码还是先做 smoke test”。这些都是 Goal 在当前 turn 中根据证据自主决定的研究动作。Harness 只提供以下不可绕过的运行时边界：
+
+- 合法 goal contract 是正式实验的前置条件；
+- 每个 Harness cycle 最多持久化一个 active experiment；
+- 实验必须 detached、可通过 run_id 恢复，并最终写入唯一终态；
+- 实验预算、资源边界、sealed 文件和结构化 hard requirements 由 Harness 核验；
+- 实验完成后只恢复 Goal，把终态结果交还给 Codex；
+- 继续、repair、replicate、修订 contract、暂停和结束研究由 Codex 决定。
+
+因此 Harness 是“异步实验运行时 + 安全内核 + 事件桥接器”，不是算法研究流程编排器。新增研究动作通常应通过 Goal prompt、MCP 能力或项目内工具扩展，而不是继续向 Harness 主循环增加阶段分支。
 
 ### 4.1 一轮研究如何串联
 

@@ -675,7 +675,9 @@ class GoalHarness:
 
     def _goal_refinement_prompt(self, objective: str, user_prompt: str) -> str:
         return (
-            "在开始任何实验前，先主动审查并优化用户提出的研究目标。"
+            "这是研究启动阶段，但 Harness 不规定你的研究步骤。你可以自由阅读代码、数据、"
+            "baseline、历史 ledger、论文或其他研究证据，检查运行环境，执行只读分析和最小验证；"
+            "在开始正式实验前，先主动审查并优化用户提出的研究目标。"
             "不要把用户原话、原始 target_metric 或次要指标直接当作最终验收标准。"
             "请检查目标是否可测量、是否与真实业务问题相关、指标是否重要、评估协议是否存在数据泄漏，"
             "并区分 hard_requirements（只能是带 metric/operator/value 的数值门槛）、protocol_requirements（自然语言协议约束）与 soft_preferences。读取 baseline、评估代码、历史 ledger 和必要的研究证据。\n"
@@ -686,7 +688,8 @@ class GoalHarness:
             "search_space、constraints、stopping、hard_requirements、protocol_requirements、soft_preferences、"
             "rejected_requirements、revision 和 reasoning_summary。"
             "该文件中的 primary_metric 必须能由 metrics.json 验证。"
-            "本 turn 只做目标澄清、证据检查和契约落盘；不要修改算法代码，不要启动实验。"
+            "必须在 research/goal_contract.json 合法后才能启动正式实验；本 turn 可以完成必要的"
+            "目标澄清、证据检查、环境准备和契约落盘，但不要把固定步骤当作研究结论。"
         )
 
     def _goal_repair_prompt(self, objective: str, user_prompt: str) -> str:
@@ -706,10 +709,13 @@ class GoalHarness:
     @staticmethod
     def _experiment_prompt() -> str:
         return (
-            "目标契约已生成。请读取 research/goal_contract.json，并以它作为当前研究目标，"
-            "而不是机械执行用户原始要求。提出多个可证伪 idea，选择最有价值的一个，"
-            "只修改允许的 worktree 文件并做 smoke test，然后只调用一次 start_experiment。"
-            "不要在本 turn 内等待实验，不要查询 RUNNING 状态。"
+            "这是一个自主研究 turn。你负责决定下一步做什么，不要机械执行预设的研究流程。"
+            "请读取 research/goal_contract.json、当前代码、环境、baseline、ledger 和历史 run，"
+            "再根据需要进行文献/数据分析、环境配置、代码修改、测试、smoke test、实验设计或结果整理。"
+            "只有在证据表明值得运行正式实验时才调用 start_experiment；一个 turn 最多启动一个实验，"
+            "调用后立即结束 turn，不要在本 turn 等待或轮询 RUNNING。"
+            "如果目标已达成、研究空间已无足够信息增益、预算耗尽或遇到无法安全恢复的阻塞，"
+            "写入符合 schema 的 goal_decision.json；否则继续自主研究。"
         )
 
     @staticmethod
@@ -758,7 +764,9 @@ class GoalHarness:
             )
         return (
             f"实验终态事件已到达，run_id={run_id}。"
-            "请只调用一次 get_experiment_result(run_id) 读取完整结果，分析 promote/discard/replicate/repair。"
+            "请先调用 get_experiment_result(run_id) 读取完整结果，然后自主决定下一步；"
+            "可以读取日志、分析数据、查阅研究证据、修改代码或环境、运行验证、replicate、repair、"
+            "修订 contract，或直接结束研究。"
             + hard_feedback + diagnostics + repair_instruction
             + "默认保持当前 research/goal_contract.json 不变，不要因为每轮实验结束就重新定义目标。"
             + "只有当实验反馈明确证明当前研究问题、指标或约束不合理、不可测量或与目标明显错位时，才修订 contract。"
