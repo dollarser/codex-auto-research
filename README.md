@@ -22,7 +22,7 @@ git switch --detach v0.2.0
 ## 当前架构
 
 ```mermaid
-flowchart LR
+flowchart TD
     G["Codex Goal<br/>研究与主动暂停"] --> S["CLI / 可选 MCP<br/>启动实验"]
     S --> W["detached Worker<br/>训练与评估"]
     S --> L["one-shot Listener<br/>绑定 run/thread"]

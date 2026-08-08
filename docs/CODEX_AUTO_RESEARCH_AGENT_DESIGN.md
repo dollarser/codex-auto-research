@@ -15,10 +15,11 @@ Codex Goal 保留完整研究自主权；外部代码只解决长实验与暂停
 ## 2. 当前架构图
 
 ```mermaid
-flowchart LR
+flowchart TD
     U["用户研究要求"] --> G["Codex Goal<br/>唯一研究 Agent"]
 
     subgraph C["Codex 控制面"]
+        direction TB
         G
         AS["Codex App Server<br/>thread / Goal / turn"]
         FT["恢复后的 follow-up turn"]
@@ -26,6 +27,7 @@ flowchart LR
     end
 
     subgraph E["实验执行面"]
+        direction TB
         API["auto-research start<br/>或可选 Experiment MCP"]
         R["ExperimentRunner<br/>持久化并提交"]
         W["detached Worker<br/>训练 / 评估"]
@@ -36,6 +38,7 @@ flowchart LR
     end
 
     subgraph P["持久状态"]
+        direction TB
         RUN["run.json / heartbeat.json<br/>metrics.json / worker.log"]
         EVENT["terminal event<br/>completed / failed / timeout<br/>cancelled / lost"]
         WAKE["wake.json<br/>run_id → thread_id"]
