@@ -1,6 +1,6 @@
 [project]
 name = "auto-research-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Event-driven autonomous algorithm research agent driven by Codex"
 readme = "README.md"
 requires-python = ">=3.10"
