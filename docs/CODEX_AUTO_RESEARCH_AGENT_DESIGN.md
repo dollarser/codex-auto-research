@@ -93,6 +93,10 @@ turn/completed
     ↓
 thread/resume(thread_id)
     ↓
+thread/goal/get + thread/read(includeTurns=true)
+    ↓
+对账 Goal/thread/遗留 turn
+    ↓
 thread/goal/set(status=active)
     ↓
 turn/start（携带 run_id 和结果已就绪的提示）
@@ -105,6 +109,10 @@ Codex 调用 get_experiment_result(run_id)
 实验提交或 `goal_decision.json` 持久化后，Harness 会把它视为当前 turn 的确定性边界。实验提交后先执行 `thread/goal/set(status=paused)`，再调用 `turn/interrupt`；完成决策落盘时使用 `status=complete`。关闭客户端时会 best-effort 暂停尚未终止的 Goal，并收尾 active turn；如果第一次暂停未确认，会在中断后、关闭传输前再尝试一次。长实验等待期间 Goal 始终保持 paused；恢复带有 `pending_run_id` 的 thread 时会重新确认 paused，只有本地终态事件到达、Harness 即将启动结果分析 turn 时才重新设为 active。目标内容更新不携带 status，避免 contract 同步意外唤醒 paused Goal。最近一次 App Server 已确认的状态持久化在 `goal_harness.json.goal_status`。
 
 已有合法完成决策的恢复启动在创建 App Server/thread 之前直接结束；`--fresh-thread` 仅供人工替换上下文，自动恢复必须使用持久化的原 thread id。这里的 `turn/interrupt` 只终止当前执行轮次，`thread/goal/set` 才负责 Goal 生命周期，两者不能互相替代。
+
+`research/goal_harness.json` 只保存最近一次 API 已确认快照。恢复已有 thread 后，App Server 的 `thread/goal/get` 与 `thread/read(includeTurns=true)` 是 Codex 状态事实源；Harness 会持久化 `goal_status`、`thread_status`、`thread_active_flags` 和检查时间。若发现一个 `inProgress` 历史 turn，则暂停 active Goal、interrupt 该 turn，并再次读取 thread 验证已经静止；多个 in-progress turn、`systemError`、无法静止的 active thread 或缺失 Goal 都进入启动失败诊断，不会盲目创建新 turn。`thread/status/changed` 与 `thread/goal/updated` 通知也会更新运行期快照。
+
+本地 `pending_run_id` 仍是实验恢复事实：它存在时，Harness 在读取 thread 前重新提交 `status=paused`，随后只等待本地实验终态。Goal 若处于 `blocked`、`usageLimited` 或 `budgetLimited`，Harness 记录 `GOAL_SUSPENDED` 并拒绝自动激活。若 App Server 为 `complete` 但缺少合法 `goal_decision.json`，Harness 只允许一个 `GOAL_DECISION_REPAIR` turn 补齐或修复结构化证据，该 turn 明确禁止启动实验；这样状态对账不会破坏“大模型格式错误交给 Codex 修复”的既有恢复路径。状态查询只发生在启动和断线恢复边界，不是周期轮询。
 
 每个 Harness 外层 cycle 还会写入 `research/active_harness_cycle.json`。MCP server 将 cycle id 写入 `run.json`，同一个 cycle 已经提交过实验后，即使 Goal 自动产生续 turn，也会拒绝第二次 `start_experiment`；Harness 关闭该提交窗口后，下一 cycle 才能启动新实验。这是程序级的串行边界，不能只依赖 Goal 提示词。
 

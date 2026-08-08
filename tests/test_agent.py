@@ -253,6 +253,65 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("status", request["params"])
         self.assertEqual(client._goal_status, "paused")
 
+    def test_app_server_reads_thread_and_goal_state_from_api(self):
+        stream = io.StringIO("\n".join([
+            json.dumps({
+                "method": "thread/status/changed",
+                "params": {"threadId": "thread-1", "status": {"type": "active", "activeFlags": []}},
+            }),
+            json.dumps({
+                "id": 1,
+                "result": {"thread": {
+                    "id": "thread-1",
+                    "status": {"type": "idle"},
+                    "turns": [{"id": "turn-old", "status": "completed", "items": []}],
+                }},
+            }),
+            json.dumps({
+                "id": 2,
+                "result": {"goal": {
+                    "threadId": "thread-1",
+                    "objective": "research",
+                    "status": "paused",
+                }},
+            }),
+        ]) + "\n")
+        stdin = io.StringIO()
+        client = AppServerClient.__new__(AppServerClient)
+        client._next_id = 1
+        client._goal_status = None
+        client.config = SimpleNamespace(app_server_response_timeout_s=60.0)
+        client.process = SimpleNamespace(stdin=stdin, stdout=stream)
+        thread_statuses = []
+        goal_statuses = []
+        client.on_thread_status_changed = thread_statuses.append
+        client.on_goal_status_changed = goal_statuses.append
+
+        thread = client.read_thread("thread-1", include_turns=True)
+        goal = client.get_goal("thread-1")
+
+        requests = [json.loads(line) for line in stdin.getvalue().splitlines()]
+        self.assertEqual([request["method"] for request in requests], ["thread/read", "thread/goal/get"])
+        self.assertEqual(thread["status"]["type"], "idle")
+        self.assertEqual(goal["status"], "paused")
+        self.assertEqual([status["type"] for status in thread_statuses], ["active", "idle"])
+        self.assertEqual(goal_statuses, ["paused"])
+
+    def test_recovered_turn_remains_active_when_first_interrupt_fails(self):
+        client = AppServerClient.__new__(AppServerClient)
+        client.last_turn_id = None
+        client._active_thread_id = None
+        client._active_turn_id = None
+        client.interrupt_turn = lambda thread_id, turn_id: (_ for _ in ()).throw(
+            AppServerTimeoutError("interrupt timed out")
+        )
+
+        with self.assertRaises(AppServerTimeoutError):
+            client.interrupt_recovered_turn("thread-1", "turn-orphan")
+
+        self.assertEqual(client._active_thread_id, "thread-1")
+        self.assertEqual(client._active_turn_id, "turn-orphan")
+
     def test_goal_harness_reactivates_goal_only_before_next_turn(self):
         from auto_research.goal_harness import GoalHarness
 
@@ -291,6 +350,16 @@ class AgentTests(unittest.TestCase):
                 last_thread_id="thread-existing",
                 initialize=lambda: lifecycle.append("initialize"),
                 resume_thread=lambda thread_id: lifecycle.append(("resume", thread_id)),
+                read_thread=lambda thread_id, include_turns=True: lifecycle.append("read") or {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                    "turns": [],
+                },
+                get_goal=lambda thread_id: {
+                    "threadId": thread_id,
+                    "objective": "research",
+                    "status": "paused",
+                },
                 set_goal_status=lambda thread_id, status: lifecycle.append(("goal", status)),
                 set_goal_objective=lambda thread_id, objective: lifecycle.append(("objective", objective)),
                 close=lambda: lifecycle.append("close"),
@@ -308,8 +377,111 @@ class AgentTests(unittest.TestCase):
 
             self.assertLess(
                 lifecycle.index(("goal", "paused")),
+                lifecycle.index("read"),
+            )
+            self.assertLess(
+                lifecycle.index("read"),
                 lifecycle.index(("wait", "run-existing")),
             )
+
+    def test_goal_harness_reconciles_and_interrupts_orphaned_turn(self):
+        from auto_research.goal_harness import GoalHarness
+
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = GoalHarness(tmp)
+            state = {}
+            lifecycle = []
+            snapshots = iter([
+                {
+                    "id": "thread-1",
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": [{"id": "turn-orphan", "status": "inProgress", "items": []}],
+                },
+                {
+                    "id": "thread-1",
+                    "status": {"type": "idle"},
+                    "turns": [{"id": "turn-orphan", "status": "interrupted", "items": []}],
+                },
+            ])
+            client = SimpleNamespace(
+                read_thread=lambda thread_id, include_turns=True: next(snapshots),
+                get_goal=lambda thread_id: {
+                    "threadId": thread_id,
+                    "objective": "research",
+                    "status": "active",
+                    "tokensUsed": 10,
+                    "timeUsedSeconds": 3,
+                },
+                set_goal_status=lambda thread_id, status: lifecycle.append(("goal", status)),
+                interrupt_recovered_turn=lambda thread_id, turn_id: lifecycle.append(("turn", turn_id)),
+            )
+
+            thread, goal = harness._reconcile_codex_state(client, "thread-1", state)
+
+            self.assertEqual(lifecycle, [("goal", "paused"), ("turn", "turn-orphan")])
+            self.assertEqual(thread["status"]["type"], "idle")
+            self.assertEqual(goal["status"], "paused")
+            self.assertEqual(state["reconciled_turn_status"], "interrupted")
+
+    def test_complete_goal_without_valid_decision_gets_repair_turn(self):
+        from auto_research.goal_harness import GoalHarness
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            research = root / "research"
+            research.mkdir()
+            (root / "goal.json").write_text(json.dumps({
+                "goal_id": "goal-complete-repair",
+                "statement": "maximize score",
+                "primary_metric": "score",
+            }), encoding="utf-8")
+            (research / "goal_harness.json").write_text(json.dumps({
+                "thread_id": "thread-existing",
+            }), encoding="utf-8")
+            prompts = []
+
+            def repair_turn(thread_id, prompt):
+                prompts.append(prompt)
+                (research / "goal_decision.json").write_text(json.dumps({
+                    "status": "complete",
+                    "decision": "plateau",
+                    "evidence_run_ids": ["run-example"],
+                    "hard_requirements_passed": False,
+                    "reason": "validated completion",
+                }), encoding="utf-8")
+                return set()
+
+            client = SimpleNamespace(
+                model="gpt-test",
+                reasoning_effort="medium",
+                last_thread_id="thread-existing",
+                config=SimpleNamespace(reconnect_attempts=1, reconnect_backoff_s=1.0),
+                initialize=lambda: None,
+                resume_thread=lambda thread_id: {},
+                read_thread=lambda thread_id, include_turns=True: {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                    "turns": [],
+                },
+                get_goal=lambda thread_id: {
+                    "threadId": thread_id,
+                    "objective": "research",
+                    "status": "complete",
+                },
+                set_goal_status=lambda thread_id, status: None,
+                set_goal_objective=lambda thread_id, objective: None,
+                start_turn=repair_turn,
+                close=lambda: None,
+            )
+            harness = GoalHarness(root)
+
+            with patch("auto_research.goal_harness.AppServerClient", return_value=client):
+                state = harness.run("objective", "prompt", max_cycles=1)
+
+            self.assertEqual(state["phase"], "COMPLETED")
+            self.assertEqual(len(prompts), 1)
+            self.assertIn("goal_decision.json", prompts[0])
+            self.assertIn("不要在本 turn 启动实验", prompts[0])
 
     def test_app_server_stdout_timeout_is_detected(self):
         read_fd, write_fd = os.pipe()
