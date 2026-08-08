@@ -93,6 +93,8 @@ turn/completed
     ↓
 thread/resume(thread_id)
     ↓
+thread/goal/set(status=active)
+    ↓
 turn/start（携带 run_id 和结果已就绪的提示）
     ↓
 Codex 调用 get_experiment_result(run_id)
@@ -100,7 +102,9 @@ Codex 调用 get_experiment_result(run_id)
 
 如果 App Server 连接断开，Harness 会有限次指数退避重连；连接恢复后优先 `thread/resume` 原 thread，并重新同步当前 Goal。若断线前 `start_experiment` 已经落盘，Harness 从 `research/runs` 恢复原 `run_id`，而不是再次提交实验。每次 `turn/start` 都记录 App Server 返回的 `turn_id`，只接收带有同一 `turnId` 的 MCP item 和 `turn/completed`；恢复 thread 时可能出现的历史 item 不会被误计入当前 turn。JSON-RPC 响应读取期间提前到达的生命周期通知会进入缓存，待 `turn/start` 响应解析后继续消费，避免丢失 `turn/completed` 导致假性超时。为避免历史 turn 或工具调用无终态时永久阻塞，App Server 响应和 turn 分别有可配置 watchdog；超时会尝试 `turn/interrupt`，禁止自动重试不确定是否已提交的 `turn/start`，并持久化 `APP_SERVER_STALLED` 状态及 stderr 诊断信息。
 
-实验提交或 `goal_decision.json` 持久化后，Harness 会把它视为当前 turn 的确定性边界，主动调用 `turn/interrupt`，再等待实验事件或关闭 App Server。关闭客户端时若仍记录 active turn，也会先做 best-effort interrupt。已有合法完成决策的恢复启动在创建 App Server/thread 之前直接结束；`--fresh-thread` 仅供人工替换上下文，自动恢复必须使用持久化的原 thread id。
+实验提交或 `goal_decision.json` 持久化后，Harness 会把它视为当前 turn 的确定性边界。实验提交后先执行 `thread/goal/set(status=paused)`，再调用 `turn/interrupt`；完成决策落盘时使用 `status=complete`。关闭客户端时会 best-effort 暂停尚未终止的 Goal，并收尾 active turn；如果第一次暂停未确认，会在中断后、关闭传输前再尝试一次。长实验等待期间 Goal 始终保持 paused；恢复带有 `pending_run_id` 的 thread 时会重新确认 paused，只有本地终态事件到达、Harness 即将启动结果分析 turn 时才重新设为 active。目标内容更新不携带 status，避免 contract 同步意外唤醒 paused Goal。最近一次 App Server 已确认的状态持久化在 `goal_harness.json.goal_status`。
+
+已有合法完成决策的恢复启动在创建 App Server/thread 之前直接结束；`--fresh-thread` 仅供人工替换上下文，自动恢复必须使用持久化的原 thread id。这里的 `turn/interrupt` 只终止当前执行轮次，`thread/goal/set` 才负责 Goal 生命周期，两者不能互相替代。
 
 每个 Harness 外层 cycle 还会写入 `research/active_harness_cycle.json`。MCP server 将 cycle id 写入 `run.json`，同一个 cycle 已经提交过实验后，即使 Goal 自动产生续 turn，也会拒绝第二次 `start_experiment`；Harness 关闭该提交窗口后，下一 cycle 才能启动新实验。这是程序级的串行边界，不能只依赖 Goal 提示词。
 
@@ -223,14 +227,14 @@ promote / discard / replicate / repair / pause
 ```text
 Codex Goal 当前 turn
   └─ start_experiment(...) -> run_id
-       └─ 当前 turn 结束
+       └─ Goal paused + 当前 turn interrupted
             └─ Detached Worker 后台运行
                  └─ 本地 GoalHarness 监听终态事件
-                      └─ 只启动一次恢复 turn
+                      └─ Goal active + 只启动一次恢复 turn
                            └─ Codex 调用 get_experiment_result(run_id)
 ```
 
-`GoalHarness` 保存 `thread_id` 和 `pending_run_id`。它只监听本地终态事件，不启动定时器，不调用 MCP 状态查询；事件到达后才恢复同一个 Goal thread。恢复 turn 可以分析结果并启动下一轮。
+`GoalHarness` 保存 `thread_id`、`pending_run_id` 和最近确认的 `goal_status`。它只监听本地终态事件，不启动定时器，不调用 MCP 状态查询；实验等待期间 Goal 为 paused，事件到达后才激活同一个 Goal thread。恢复 turn 可以分析结果并启动下一轮。
 
 ## 6. Experiment MCP 工具
 

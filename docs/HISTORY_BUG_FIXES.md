@@ -174,6 +174,14 @@ Worker 现在 detached、独立 session、保存 PID/heartbeat；终端、App Se
 
 验证：`test_app_server_interrupts_turn_after_durable_run_is_discovered`、`test_completed_decision_is_consumed_before_app_server_start`；完整测试集 42 项通过。
 
+### 19. 中断 turn 后 Goal 仍为 active
+
+问题：`turn/interrupt` 只结束当前 turn，不会改变 thread 上的 Goal 状态。旧实现虽然在实验落盘后中断 turn，但 Goal 仍保持 `active`；关闭 App Server 或在桌面端重新打开任务时，仍可能出现非预期续跑。恢复含 `pending_run_id` 的 Harness 时，如果过早同步目标，也可能在几个小时的实验等待期间把 Goal 唤醒。
+
+修复：实验落盘后先把同一 thread 的 Goal 设置为 `paused`，再中断当前 turn；`goal_decision.json` 落盘后设置为 `complete`。关闭 App Server 时会 best-effort 暂停非终态 Goal，并在首次暂停失败时于中断后重试；恢复带有 `pending_run_id` 的 thread 时也会重新确认 paused。实验终态到达后，仅在下一次 `turn/start` 前重新设置为 `active`。目标 contract 内容同步不再携带 status，避免意外改变 paused 状态。Harness 状态新增 `goal_status` 和 `goal_status_changed_at` 作为 App Server 确认记录。
+
+验证：`test_app_server_interrupts_turn_after_durable_run_is_discovered`、`test_app_server_marks_goal_complete_after_durable_decision`、`test_app_server_close_pauses_goal_without_active_turn`、`test_goal_objective_update_preserves_paused_status`、`test_goal_harness_reactivates_goal_only_before_next_turn`、`test_goal_harness_reconfirms_pause_before_waiting_for_resumed_run`。
+
 ## 验证标准
 
 ```bash
