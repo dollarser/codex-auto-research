@@ -166,6 +166,14 @@ Worker 现在 detached、独立 session、保存 PID/heartbeat；终端、App Se
 
 验证：`test_structured_goal_decision_is_required_and_validated`；完整测试集 40 项通过。
 
+### 18. 后台重启制造多个未完成 Codex 会话
+
+问题：旧后台命令反复携带 `--fresh-thread`，launchd 每次拉起都会执行 `thread/start`。同时，Harness 在 durable run 出现后提前返回，却没有中断仍活跃的 turn；关闭 App Server 也只是终止进程。这会留下多个服务端仍标记为 active 的 Goal/turn，桌面端重新打开后可能继续执行。
+
+修复：合法完成决策现在会在创建 App Server 之前被消费；durable run 或完成决策成为明确 turn 边界，Harness 会 best-effort `turn/interrupt` 并记录 `turn_status`、`turn_finished_at`；关闭 App Server 前也会收尾 active turn。`--fresh-thread` 明确限制为人工替换上下文，自动恢复必须复用持久化 thread id。
+
+验证：`test_app_server_interrupts_turn_after_durable_run_is_discovered`、`test_completed_decision_is_consumed_before_app_server_start`；完整测试集 42 项通过。
+
 ## 验证标准
 
 ```bash

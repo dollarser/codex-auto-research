@@ -147,6 +147,9 @@ class AppServerClient:
         self._stderr_thread.start()
         self._next_id = 1
         self.last_thread_id: str | None = None
+        self.last_turn_id: str | None = None
+        self._active_thread_id: str | None = None
+        self._active_turn_id: str | None = None
 
     def _drain_stderr(self) -> None:
         if not self.process.stderr:
@@ -314,6 +317,25 @@ class AppServerClient:
         request_id = self._send("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
         self._read_response(request_id, timeout_s=min(self.config.app_server_response_timeout_s, 10.0))
 
+    def _mark_turn_finished(self, thread_id: str, turn_id: str, reason: str) -> None:
+        if self._active_thread_id == thread_id and self._active_turn_id == turn_id:
+            self._active_thread_id = None
+            self._active_turn_id = None
+        callback = getattr(self, "on_turn_finished", None)
+        if callable(callback):
+            callback(turn_id, reason)
+
+    def _interrupt_active_turn(self, thread_id: str, turn_id: str, reason: str) -> None:
+        """Close a durable submission/decision turn before releasing App Server."""
+        try:
+            self.interrupt_turn(thread_id, turn_id)
+        except (AppServerConnectionError, AppServerTimeoutError, RuntimeError, OSError):
+            # The turn may have completed between the durable file write and
+            # this request. The durable boundary is still authoritative.
+            pass
+        finally:
+            self._mark_turn_finished(thread_id, turn_id, reason)
+
     def start_turn(self, thread_id: str, prompt: str) -> set[str]:
         if not hasattr(self, "_pending_messages"):
             self._pending_messages = deque()
@@ -338,6 +360,8 @@ class AppServerClient:
         if not isinstance(active_turn_id, str) or not active_turn_id:
             raise AppServerConnectionError("turn/start response did not contain a turn id")
         self.last_turn_id = active_turn_id
+        self._active_thread_id = thread_id
+        self._active_turn_id = active_turn_id
         callback = getattr(self, "on_turn_started", None)
         if callable(callback):
             callback(active_turn_id)
@@ -351,10 +375,7 @@ class AppServerClient:
         while True:
             remaining = turn_deadline - time.monotonic()
             if remaining <= 0:
-                try:
-                    self.interrupt_turn(thread_id, active_turn_id)
-                except (AppServerConnectionError, RuntimeError):
-                    pass
+                self._interrupt_active_turn(thread_id, active_turn_id, "turn_timeout")
                 raise AppServerTurnTimeout(
                     f"turn {active_turn_id} exceeded {self.config.app_server_turn_timeout_s:.1f}s; "
                     "the turn was interrupted or the App Server must be restarted",
@@ -363,11 +384,13 @@ class AppServerClient:
             try:
                 completion_probe = getattr(self, "completion_probe", None)
                 if callable(completion_probe) and completion_probe():
+                    self._interrupt_active_turn(thread_id, active_turn_id, "decision_persisted")
                     return run_ids
                 run_probe = getattr(self, "run_probe", None)
                 if callable(run_probe):
                     discovered_runs = run_probe()
                     if discovered_runs:
+                        self._interrupt_active_turn(thread_id, active_turn_id, "experiment_persisted")
                         return set(discovered_runs) | run_ids
                 if self._pending_messages:
                     message = self._pending_messages.popleft()
@@ -381,10 +404,7 @@ class AppServerClient:
                     except json.JSONDecodeError as exc:
                         raise AppServerConnectionError(f"Invalid App Server JSONL event: {line[:500]!r}") from exc
             except AppServerTimeoutError as exc:
-                try:
-                    self.interrupt_turn(thread_id, active_turn_id)
-                except (AppServerConnectionError, RuntimeError):
-                    pass
+                self._interrupt_active_turn(thread_id, active_turn_id, "event_idle_timeout")
                 raise AppServerTurnTimeout(str(exc), turn_id=active_turn_id) from exc
             if self._handle_server_request(message):
                 continue
@@ -405,6 +425,7 @@ class AppServerClient:
                         # A durable start_experiment result is sufficient to
                         # close the submission turn when App Server omits the
                         # later turn/completed notification.
+                        self._interrupt_active_turn(thread_id, active_turn_id, "experiment_persisted")
                         return run_ids
                 # Some App Server builds persist task_complete/final_answer
                 # but omit the wire-level turn/completed notification. A
@@ -412,12 +433,18 @@ class AppServerClient:
                 # it as a conservative lifecycle fallback so the Harness does
                 # not wait until the 900s watchdog.
                 if item.get("type") == "agentMessage" and item.get("phase") == "final_answer":
+                    self._mark_turn_finished(thread_id, active_turn_id, "final_answer")
                     return run_ids
             if message.get("method") == "turn/completed" and message_turn_id == active_turn_id:
+                self._mark_turn_finished(thread_id, active_turn_id, "turn_completed")
                 return run_ids
 
     def close(self) -> None:
         if self.process.poll() is None:
+            active_thread_id = getattr(self, "_active_thread_id", None)
+            active_turn_id = getattr(self, "_active_turn_id", None)
+            if active_thread_id and active_turn_id:
+                self._interrupt_active_turn(active_thread_id, active_turn_id, "client_closing")
             self.process.terminate()
             try:
                 self.process.wait(timeout=5)
@@ -933,6 +960,8 @@ class GoalHarness:
             "stop_reason": None,
             "turn_id": None,
             "turn_started_at": None,
+            "turn_finished_at": None,
+            "turn_status": None,
             "app_server_context": "",
             "app_server_stderr": "",
             "app_server_returncode": None,
@@ -945,15 +974,40 @@ class GoalHarness:
         client: AppServerClient | None = None
         startup_complete = False
         try:
+            # A terminal decision is durable and must be consumed before
+            # starting App Server. Otherwise a supervised invocation using
+            # --fresh-thread creates a new visible Codex session on every
+            # restart even though the research is already complete.
+            if not state.get("pending_run_id"):
+                decision = self._read_goal_decision()
+                if decision and decision.get("status") == "complete":
+                    state.update({
+                        "phase": "COMPLETED",
+                        "stop_reason": decision.get("decision"),
+                        "reason": decision.get("reason", "Codex Goal declared the research complete"),
+                        "pending_run_id": None,
+                    })
+                    self._save(state)
+                    return state
             client = AppServerClient(self.project_dir)
             client.completion_probe = lambda: self._read_goal_decision() is not None
             def persist_turn_started(turn_id: str) -> None:
                 state.update({
                     "turn_id": turn_id,
                     "turn_started_at": time.time(),
+                    "turn_finished_at": None,
+                    "turn_status": "running",
                 })
                 self._save(state)
+            def persist_turn_finished(turn_id: str, reason: str) -> None:
+                if state.get("turn_id") == turn_id:
+                    state.update({
+                        "turn_finished_at": time.time(),
+                        "turn_status": reason,
+                    })
+                    self._save(state)
             client.on_turn_started = persist_turn_started
+            client.on_turn_finished = persist_turn_finished
             client.initialize()
             state.update({
                 "codex_model": client.model,
@@ -993,20 +1047,6 @@ class GoalHarness:
                 current_prompt = self._goal_refinement_prompt(objective, prompt)
             else:
                 current_prompt = self._experiment_prompt()
-            # A previous turn may have written a terminal research decision
-            # before its lifecycle notification was lost. Consume it before
-            # opening another experiment cycle on restart.
-            if not pending_run_id:
-                decision = self._read_goal_decision()
-                if decision and decision.get("status") == "complete":
-                    state.update({
-                        "phase": "COMPLETED",
-                        "stop_reason": decision.get("decision"),
-                        "reason": decision.get("reason", "Codex Goal declared the research complete"),
-                        "pending_run_id": None,
-                    })
-                    self._save(state)
-                    return state
             for cycle in range(max_cycles):
                 self._reconcile_completed_run_count(state)
                 if pending_run_id:

@@ -129,6 +129,8 @@ uv run auto-research register-mcp --project /path/to/experiment-repo
 
 Harness 会按 App Server 的 `turn_id` 关联 MCP 事件。恢复历史 thread 时，即使事件流包含旧 turn 的 MCP item，也不会把旧 `run_id` 误认为当前 turn 新启动的实验。App Server 响应默认 60 秒、单个 turn 默认 900 秒超时；超时会尝试 `turn/interrupt`，不盲目重试 `turn/start`，并把状态保存为 `APP_SERVER_STALLED`，避免静默连接无限阻塞。可通过 `AUTO_RESEARCH_APP_SERVER_RESPONSE_TIMEOUT_S` 和 `AUTO_RESEARCH_APP_SERVER_TURN_TIMEOUT_S` 覆盖。
 
+`--fresh-thread` 只用于人工明确替换当前 Codex thread，不用于守护进程重启。正常恢复必须复用 `goal_harness.json.thread_id`。实验 run 或完成决策一旦持久化，Harness 会主动 interrupt 当前 turn 后再进入等待/退出；已有合法完成决策时会在启动 App Server 之前直接返回，避免产生孤立的进行中会话。
+
 也可以单独启动 MCP server：
 
 ```bash

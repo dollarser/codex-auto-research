@@ -40,7 +40,10 @@ def main(argv: list[str] | None = None) -> int:
     harness.add_argument(
         "--fresh-thread",
         action="store_true",
-        help="start a new Codex thread while preserving durable research state",
+        help=(
+            "explicitly replace the persisted Codex thread while preserving research state; "
+            "do not use for automatic restart/recovery"
+        ),
     )
 
     args = parser.parse_args(argv)
