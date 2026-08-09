@@ -2,7 +2,7 @@
 
 当前 `main` 是 v0.3 简化方案：Codex Goal 是唯一研究 Agent；本项目只提供 detached 实验运行和一个事件驱动的 Goal 唤醒桥。
 
-Codex 自己负责优化目标、调查资料、提出 idea、修改代码、判断实验是否稳定、暂停 Goal、分析结果以及决定继续或完成。本项目不再运行固定 cycle，也不替 Codex 决定研究步骤。
+Codex 自己负责优化目标、调查资料、提出 idea、修改代码、判断实验是否稳定、结束提交 turn、分析结果以及决定继续或完成。Listener 只在实验交接边界确认 Goal paused/active；本项目不再运行固定 cycle，也不替 Codex 决定研究步骤。
 
 ## 版本
 
@@ -23,16 +23,21 @@ git switch --detach v0.2.0
 
 ```mermaid
 flowchart TD
-    G["Codex Goal<br/>研究与主动暂停"] --> S["CLI / 可选 MCP<br/>启动实验"]
+    SB["session --create-thread<br/>仅首次显式创建"] --> D["项目专用 Codex task<br/>cwd = 实验项目根目录"]
+    D --> G["Codex Goal<br/>研究并结束提交 turn"]
+    SB --> F["research/codex_session.json<br/>持久 thread_id"]
+    F -.->|"后续 session/start 复用"| D
+    G --> S["CLI / 可选 MCP<br/>启动实验"]
     S --> W["detached Worker<br/>训练与评估"]
     S --> L["one-shot Listener<br/>绑定 run/thread"]
+    L --> GP["Goal paused<br/>跨提交 turn 再确认"]
     W --> E["terminal event"]
     E --> L
-    L --> A["Codex App Server<br/>恢复原 Goal + turn/start"]
+    L --> A["Codex App Server<br/>仅设置原 Goal = active"]
     A --> G
 ```
 
-Listener 不轮询 Codex，也不创建研究 cycle。安装 `watchfiles` 时监听操作系统文件事件；否则只轮询本地终态文件，不调用模型或 MCP。
+Listener 不调用 `thread/resume` 或 `turn/start`，不会和桌面端争抢 thread writer，也不创建研究 cycle。它只把持久 Goal 从 `paused` 改回 `active`，后续 turn 完全由原生 Goal 调度器拥有。安装 `watchfiles` 时监听操作系统文件事件；否则只轮询本地终态文件，不调用模型或 MCP。
 
 ## 研究闭环
 
@@ -43,7 +48,7 @@ flowchart TD
     C --> D{"Worker 稳定运行?"}
     D -->|"否"| E["诊断、修复、重启"]
     E --> C
-    D -->|"是"| F["Codex 主动暂停 Goal"]
+    D -->|"是"| F["Codex 结束提交 turn<br/>Listener 确认 Goal paused"]
     F --> G["Worker 后台运行<br/>Codex 不运行"]
     G --> H["终态事件唤醒原 Goal"]
     H --> I["分析结果并更新 idea"]
@@ -97,6 +102,35 @@ uv run auto-research init /path/to/experiment-project
 
 配置模板见 [config.toml.example](config.toml.example)。
 
+## 推荐：为实验项目创建一个专用会话
+
+首次启动一个项目时显式传 `--create-thread`：
+
+```bash
+uv run auto-research session \
+  --project /path/to/experiment-project \
+  --create-thread \
+  --title "Breast Cancer Auto Research"
+```
+
+该命令通过 Codex App Server 创建一个 `cwd` 精确等于实验项目根目录的持久 task，命名后把 Goal 设为 `paused`，并立即把 `thread_id` 写入本机状态 `research/codex_session.json`（已加入 `.gitignore`）。默认 objective 来自 `goal.json.statement`，也可以显式传 `--objective`。
+
+`--create-thread` 是幂等的：即使重复执行，也会验证并复用状态文件中的 task，不会再次调用 `thread/start`。后续只需：
+
+```bash
+uv run auto-research session --project /path/to/experiment-project
+```
+
+如果已经在 Codex 中手动建好了绑定该目录的 task，可以采用它而不创建新 task：
+
+```bash
+uv run auto-research session \
+  --project /path/to/experiment-project \
+  --thread-id <existing-codex-thread-id>
+```
+
+只有显式提供新的 `--objective --replace-goal` 才会替换已有 Goal；普通复用不会重置 Goal 用量或目标。会话准备命令也不会调用 `turn/start`，因此不会在后台留下一个无人管理的 active turn。新 task 默认 paused，首次创建后在 Codex 中打开输出的 `thread_id`，发送研究启动指令并激活 Goal 即可。
+
 ## 推荐：Codex 直接启动实验
 
 在 Codex Goal 中执行：
@@ -127,10 +161,12 @@ uv run auto-research start \
 
 1. 落盘 `run.json`。
 2. 启动独立 session 的 detached Worker。
-3. 优先从 `CODEX_THREAD_ID` 精确绑定当前 Goal task。
+3. 在 Codex 内优先从 `CODEX_THREAD_ID` 精确绑定当前 Goal task；终端调用则复用 `research/codex_session.json` 中的专用 task。
 4. 启动 detached one-shot listener。
 
-Codex 随后检查 `heartbeat.json` 或日志，确认实验稳定运行，然后主动暂停 Goal。不要让 Codex 循环查询 `RUNNING`。
+如果当前 `CODEX_THREAD_ID` 与项目专用 task 不一致，提交会直接失败，避免实验完成后唤醒错误会话。请切换到专用 task 后重试。
+
+Codex 随后检查 `heartbeat.json` 或日志，确认实验稳定运行，然后结束当前 turn。Listener 会先写入 paused，并在该 turn 持久结束后再次确认 paused，避免 turn finalization 把状态覆盖回 active。不要让 Codex 循环查询 `RUNNING`。
 
 推荐提示词见 [Codex Goal 提示词](docs/CODEX_GOAL_PROMPT.md)。
 
@@ -158,8 +194,8 @@ research/runs/<run_id>/
 `wake.json` 状态转换如下：
 
 ```text
-BINDING -> WAITING -> TERMINAL -> WAKING -> GOAL_RUNNING -> WOKEN
-                         └───────────────────────────────> SKIPPED
+BINDING -> PAUSE_HANDOFF -> WAITING -> TERMINAL -> ACTIVATING -> ACTIVATED
+              └──────────────────────────────────────────> SKIPPED
 ```
 
 ## 异常恢复
@@ -194,7 +230,7 @@ MCP 只提供：
 - `get_experiment_result`
 - `cancel_experiment`
 
-`start_experiment` 与 CLI `start` 使用相同 Runner，并自动启动同一个 one-shot listener。MCP 不控制 Goal 状态，也不做算法判断。
+`start_experiment` 与 CLI `start` 使用相同 Runner，并自动启动同一个 one-shot listener。MCP 工具本身不判断 Goal 或算法；paused/active 交接由 Listener 完成。
 
 ## 安全和并发边界
 
@@ -202,17 +238,18 @@ MCP 只提供：
 - `idempotency_key` 防止工具重试重复提交。
 - Worker 使用独立 session；终端、MCP 或 Codex turn 结束不会杀死训练。
 - 终态写入带锁，成功、失败、超时、取消和 LOST 只会有一个最终结果。
-- Listener 按 `run_id -> thread_id` 持久绑定并加单实例锁，重复文件事件不会启动多个 turn。
-- Goal 已经 active、complete、blocked 或受限时，Listener 不会盲目创建重复 turn。
-- 当前按要求默认 `shell=true`、`danger-full-access`；仅在隔离实验环境使用。
+- Listener 按 `run_id -> thread_id` 持久绑定并加单实例锁，重复文件事件不会重复激活 Goal。
+- 专用 task 只在首次显式 `--create-thread` 时创建；状态文件损坏或项目 `cwd` 不匹配时失败关闭，不自动猜测或补建。
+- Goal 已经由其他执行者运行、complete、blocked 或受限时，Listener 不会盲目激活。
+- Listener 不设置 Codex 模型、reasoning effort、sandbox 或 approval；这些属性继承原 Goal task。实验命令当前默认 `shell=true`，只应在隔离实验环境使用。
 
 ## 文档
 
 - [当前方案设计](docs/CODEX_AUTO_RESEARCH_AGENT_DESIGN.md)
 - [Codex Goal 提示词](docs/CODEX_GOAL_PROMPT.md)
 - [版本与历史方案](docs/HISTORY_DESIGN_ALTERNATIVES.md)
-- [v0.1/v0.2 历史问题修复](docs/HISTORY_BUG_FIXES.md)
-- [Codex App Server 官方文档](https://developers.openai.com/codex/app-server)
+- [历史问题与修复](docs/HISTORY_BUG_FIXES.md)
+- [Codex App Server 官方文档](https://learn.chatgpt.com/docs/app-server)
 
 ## 验证
 

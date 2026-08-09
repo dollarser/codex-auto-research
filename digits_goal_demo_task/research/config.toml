@@ -10,6 +10,6 @@ event_grace_s = 30.0
 [experiment]
 use_shell = true
 allowed_executables = ["python", "python3"]
-default_timeout_s = 180
-worker_heartbeat_s = 5.0
+default_timeout_s = 120
+worker_heartbeat_s = 1.0
 one_active_experiment = true

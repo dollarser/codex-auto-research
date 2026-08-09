@@ -6,7 +6,7 @@ Codex Goal 保留完整研究自主权；外部代码只解决长实验与暂停
 
 核心原则：
 
-1. Codex 决定研究内容和 Goal 生命周期。
+1. Codex 决定研究内容；Listener 只在实验交接边界切换 paused/active。
 2. Worker 独立于 Codex turn 执行。
 3. Goal 暂停期间不运行模型、不查询 `RUNNING`。
 4. 终态事件只触发一次对原 Goal 的恢复。
@@ -16,14 +16,16 @@ Codex Goal 保留完整研究自主权；外部代码只解决长实验与暂停
 
 ```mermaid
 flowchart TD
-    U["用户研究要求"] --> G["Codex Goal<br/>唯一研究 Agent"]
+    U["用户研究要求"] --> B["Session Bootstrap<br/>显式 create 或默认 reuse"]
+    B --> S["research/codex_session.json<br/>project_root + thread_id"]
+    S --> G["项目专用 Codex Goal task<br/>唯一研究 Agent"]
 
     subgraph C["Codex 控制面"]
         direction TB
         G
-        AS["Codex App Server<br/>thread / Goal / turn"]
-        FT["恢复后的 follow-up turn"]
-        AS --> FT --> G
+        AS["Codex App Server<br/>持久 Goal 状态"]
+        NS["原生 Goal scheduler<br/>拥有 continuation turn"]
+        AS --> NS --> G
     end
 
     subgraph E["实验执行面"]
@@ -45,28 +47,66 @@ flowchart TD
     end
 
     G -->|"选择 idea 并启动"| API
-    G -.->|"确认 Worker 稳定后<br/>主动暂停 Goal"| AS
+    G -.->|"确认 Worker 稳定后<br/>结束提交 turn"| L
+    L -->|"提交 turn 边界后<br/>Goal = paused"| AS
     W --> RUN
     W --> EVENT
     L --> WAKE
     EVENT -->|"文件事件"| L
-    L -->|"thread/resume<br/>Goal active<br/>turn/start"| AS
+    L -->|"thread/goal/set<br/>status = active"| AS
 ```
 
-图中的关键边界是：Codex 负责“为什么实验、实验什么、何时暂停、结果意味着什么”；Listener 只负责“终态出现后，让同一个 Goal task 再运行起来”。
+图中的关键边界是：Codex 负责“为什么实验、实验什么、何时结束提交 turn、结果意味着什么”；Listener 只负责在该 turn 边界确认 paused，并在终态后让同一个 Goal task 再运行起来。
+
+Session Bootstrap 只在研究开始前运行，不属于单次实验闭环。它负责创建或采用一个 `cwd` 精确绑定实验项目的持久 task；之后所有实验都复用该 task，Listener 仍然不会创建会话或 turn。
 
 ## 3. 组件边界
 
 | 组件 | 负责 | 不负责 |
 |---|---|---|
-| Codex Goal | 目标优化、资料研究、idea、代码、实验解释、暂停与完成 | 后台进程保活 |
+| Codex Goal | 目标优化、资料研究、idea、代码、实验解释与完成 | 后台进程保活、外部 turn 创建 |
+| Session Bootstrap | 显式创建一次或采用现有 task、校验项目 cwd、命名、持久绑定 | 自动重复创建、启动研究 turn、实验调度 |
 | CLI / Experiment MCP | 确定性提交、结果读取、取消 | 研究策略、Goal 状态 |
 | ExperimentRunner | run 持久化、并发边界、detached Worker 启动 | 训练内容、idea 选择 |
 | detached Worker | 执行命令、heartbeat、metrics、终态 | 唤醒 Codex |
-| Goal Wake Listener | run/thread 绑定、等待终态、恢复一次 Goal | cycle、idea、指标判断 |
-| Codex App Server | thread/Goal 持久状态和 turn 执行控制面 | 实验执行 |
+| Goal Wake Listener | run/thread 绑定、在提交 turn 后确认 paused、等待终态、激活一次 Goal | cycle、idea、指标判断、turn 创建 |
+| Codex App Server | 持久 Goal 状态更新 | 实验执行、Listener 自建 turn |
 
 依赖方向保持单向：Codex 可以调用实验入口；实验执行层不调用研究策略；Listener 只通过 App Server 恢复 Codex。
+
+### 3.1 专用会话的创建与复用
+
+入口为：
+
+```bash
+auto-research session --project <root> --create-thread
+```
+
+语义如下：
+
+1. `--create-thread` 只表示“缺失时创建”，不是“强制新建”。
+2. 创建成功取得 `thread_id` 后，先原子写入 `research/codex_session.json`，再执行命名和 Goal 初始化；后续 RPC 失败时重试仍使用同一个 thread。
+3. 文件锁覆盖读取、创建与写入事务，两个并发启动者最多只有一个能调用 `thread/start`。
+4. 已有状态时调用 `thread/read`，要求 thread 的 `cwd` 与规范化项目根目录完全一致。
+5. 状态文件损坏、项目不匹配或显式 thread 冲突时失败关闭，不把异常解释为“尚未创建”。
+6. 新 task 的 Goal 默认设为 `paused`，Bootstrap 不调用 `turn/start`；首次研究 turn 由 Codex 桌面端或用户启动，避免再次形成空 active task。
+7. 已有 task 可通过 `--thread-id` 采用；已有 Goal 默认保留，只有显式 `--objective --replace-goal` 才允许替换。
+
+`research/codex_session.json` 是项目级唯一绑定，典型内容为：
+
+```json
+{
+  "schema_version": 1,
+  "project_root": "/absolute/path/to/project",
+  "thread_id": "019f...",
+  "title": "Auto Research · project",
+  "objective": "...",
+  "ownership": "auto_created",
+  "setup_state": "ready"
+}
+```
+
+实验提交时的 thread 解析顺序是：显式 `thread_id`、当前 `CODEX_THREAD_ID`、项目持久绑定。若当前 Codex task 与项目专用 task 不同，提交直接失败，而不是把实验绑定到另一个上下文。
 
 ## 4. 自动研究闭环流程图
 
@@ -81,7 +121,7 @@ flowchart TD
     G --> H{"Codex 判断实验<br/>是否稳定后台运行"}
     H -->|"否"| I["诊断启动问题<br/>修复或取消"]
     I --> F
-    H -->|"是"| J["Codex 主动暂停 Goal<br/>当前 turn 结束"]
+    H -->|"是"| J["Codex 结束当前 turn<br/>Listener 确认 Goal paused"]
     J --> K["Worker 独立运行数小时<br/>Codex 不运行"]
     K --> L{"终态事件"}
     L -->|"COMPLETED"| M["Listener 恢复原 Goal"]
@@ -115,16 +155,16 @@ sequenceDiagram
     R->>L: detached spawn(run_id, thread_id)
     API-->>G: run_id + listener ARMED
     G->>W: 读取 heartbeat / worker.log
-    Note over G: 判断运行稳定后主动暂停 Goal
-    G-->>A: Goal status = paused
+    L->>A: Goal status = paused
+    Note over G: 判断运行稳定后结束当前 turn
+    L->>A: turn 结束后再次确认 paused
     Note over G,A: Codex 停止运行，不轮询实验
     W->>W: 训练 / 评估数小时
     W-->>L: 写入 terminal event
-    L->>A: thread/resume(thread_id)
-    L->>A: thread/goal/get + thread/read
-    L->>A: thread/goal/set(active)
-    L->>A: turn/start(run_id + result path)
-    A-->>G: 恢复同一个 Goal task
+    L->>A: thread/goal/get(thread_id)
+    L->>A: thread/goal/set(status=active)
+    Note over L,A: Listener 标记 ACTIVATED 后立即退出
+    A-->>G: 原生 Goal scheduler 产生 continuation turn
     G->>G: 分析结果、更新知识、选择下一步
     alt 达成目标
         G-->>A: Goal complete
@@ -133,11 +173,9 @@ sequenceDiagram
         Note over G: 确认稳定后再次暂停
         G-->>A: Goal paused
     end
-    A-->>L: goal updated: paused / complete
-    L->>L: 标记 WOKEN 并退出
 ```
 
-Listener 只显式创建一个恢复 turn。Goal 后续若产生原生续 turn，Listener 只保持 App Server 执行宿主存活，不负责创建研究循环。
+Listener 不显式创建恢复 turn。它只提交一次持久 Goal 状态转换；原生 Goal scheduler 负责 continuation turn，因此桌面端、Listener 和独立 App Server 之间不会出现 writer 所有权竞争。
 
 ## 6. 运行状态与所有权
 
@@ -146,19 +184,21 @@ stateDiagram-v2
     [*] --> BINDING
     BINDING --> BINDING_RETRY: thread 不明确或 App Server 不可用
     BINDING_RETRY --> BINDING: 指数退避重试
-    BINDING --> WAITING: run_id 与 thread_id 已持久绑定
+    BINDING --> PAUSE_HANDOFF: run_id 与 thread_id 已持久绑定
+    PAUSE_HANDOFF --> PAUSE_RETRY: App Server 暂时失败
+    PAUSE_RETRY --> PAUSE_HANDOFF: 指数退避重试
+    PAUSE_HANDOFF --> WAITING: 提交 turn 已结束且 Goal paused
     WAITING --> TERMINAL: 收到任一终态事件
-    TERMINAL --> WAKING
-    WAKING --> WAKE_RETRY: App Server 暂时失败
-    WAKE_RETRY --> WAKING: 指数退避重试
-    WAKING --> GOAL_RUNNING: turn/start 成功
-    GOAL_RUNNING --> WOKEN: Goal 再次 paused / complete
+    TERMINAL --> ACTIVATING
+    ACTIVATING --> ACTIVATION_RETRY: App Server 暂时失败
+    ACTIVATION_RETRY --> ACTIVATING: 指数退避重试
+    ACTIVATING --> ACTIVATED: Goal status = active
     TERMINAL --> SKIPPED: Goal 已 active / complete / blocked / limited
-    WOKEN --> [*]
+    ACTIVATED --> [*]
     SKIPPED --> [*]
 ```
 
-`WAITING` 期间只有 Worker 和本地 Listener 运行；Codex Goal、推理模型和 MCP 状态查询均不运行。
+`PAUSE_HANDOFF` 期间 Listener 只读取持久 Goal 状态，等待提交 turn 的 token 使用量或状态发生变化，再次写 paused；这不是模型轮询。`WAITING` 期间只有 Worker 和本地 Listener 运行，Codex Goal、推理模型和 MCP 状态查询均不运行。
 
 ## 7. thread 绑定
 
@@ -169,23 +209,25 @@ stateDiagram-v2
 3. 当前 Codex 工具环境的 `CODEX_THREAD_ID`，并通过 App Server 再验证。
 4. `thread/list(cwd=<project>)` 中最近的 active/paused Goal。
 
+在 Session Bootstrap 已配置的项目中，实验提交会预先把专用 `thread_id` 写入 run，Listener 通常不会走到第 4 级自动发现。自动发现仅作为未迁移项目的兼容恢复路径。
+
 自动发现只接受与 run 创建时间接近的候选。多个候选时间相同或候选过旧时，Listener 保持 `BINDING_RETRY`，等待显式绑定，不采用“最新历史会话”猜测。
 
 `run_id -> thread_id` 写入每个 run 的 `wake.json`，之后恢复不再重新选择任务。
 
-## 8. 为什么 Listener 需要保持 App Server 存活
+## 8. 为什么 Listener 只激活 Goal，不启动 turn
 
-`thread/goal/set(status=active)` 只改变持久 Goal 状态；`turn/start` 才开始生成。通过 stdio 启动的 App Server 同时是本次恢复执行的宿主，如果在 `turn/start` 后立即终止，可能留下一个 UI 中显示 active、实际没有执行进程的任务。
+官方 App Server 协议把 `thread/resume` 定义为重新打开已有 thread，把 `turn/start` 定义为启动生成；而桌面端本身已经是该 thread 的执行宿主。真实验证发现，Listener 再启动一个独立 App Server 并调用 `thread/resume` 会与桌面端争抢 writer，出现 `already has an active writer`。
 
-因此 Listener 在发起恢复 turn 后继续读取 App Server 事件，直到 Goal 再次进入：
+因此当前 Listener 只使用不接管 turn 的接口：
 
-- `paused`
-- `complete`
-- `blocked`
-- `usageLimited`
-- `budgetLimited`
+1. `thread/goal/get` 核对 Goal 仍可恢复并记录 turn 前的 usage。
+2. `thread/goal/set(status=paused)` 请求暂停；提交 turn 结束后再次确认 paused。
+3. 实验终态后再次读取 Goal；已经 active 或已终止时不重复激活。
+4. `thread/goal/set(status=active)` 激活持久 Goal。
+5. 写入 `ACTIVATED` 后退出。
 
-这不是模型轮询，不产生额外 token。Goal 已进入静止状态但 App Server 缺少 `turn/completed` 时，Listener 只保留一个有限的收尾窗口，不永久占用执行宿主。
+模型、reasoning effort、sandbox、approval 和 continuation turn 都继承原 Goal task，由原生 Goal scheduler 管理；Listener 不再有模型配置和长 turn watchdog。
 
 ## 9. 幂等与竞态
 
@@ -194,15 +236,17 @@ stateDiagram-v2
 - `thread_id`
 - `state`
 - `terminal_status`
-- `wake_turn_id`
+- `activated_at`
+- `pause_requested_at`
+- `pause_boundary_observed_at`
 - `attempts`
 - `last_error`
 
-恢复前读取 `thread/read`：
+激活前读取持久 Goal 状态：
 
-- thread 已 active 且没有本 Listener 的 `wake_turn_id`：认为用户或其他恢复器已接管，标记 `SKIPPED`。
+- Goal 已 active：认为用户或原生调度器已接管，标记 `SKIPPED`。
 - Goal complete/blocked/limited：不自动激活，标记 `SKIPPED`。
-- Listener 在 `turn/start` 后断线：保留 `wake_turn_id`；重启时优先附着已有 active turn，不创建第二个 turn。
+- Listener 在激活响应前断线：重启后重新核对 Goal/thread；已 active 的任务不会创建第二个 turn。
 - `recover-wakes` 只恢复带有 `runtime_version=3` 和 `wake_enabled=true` 的 run，不接管 v0.1/v0.2 历史实验。
 
 ## 10. 失败模型
@@ -214,7 +258,7 @@ stateDiagram-v2
 | App Server 暂时不可用 | 本地指数退避重试，不调用模型 |
 | Listener 崩溃/机器重启 | `recover-wakes` 从 run/wake 文件恢复 |
 | thread 候选不明确 | 不猜测；持续 `BINDING_RETRY` 或显式 `--thread-id` |
-| 重复终态文件事件 | 单实例锁和终态锁阻止重复 turn |
+| 重复终态文件事件 | 单实例锁和持久 `ACTIVATED` 状态阻止重复激活 |
 | Goal 已被人工恢复 | thread active 时 Listener 跳过重复唤醒 |
 
 ## 11. 与历史架构方案对比
@@ -227,7 +271,7 @@ stateDiagram-v2
 | Agents SDK Director + Codex MCP Server | Agents SDK Director | 外层 Agent | 外层管理 | 外层管理 | 外层 handoff | 高但分散 | 最高 | 适合多 specialist 和 trace，本项目不需要第二个主 Agent |
 | v0.1 完整 GoalHarness | Harness 与 Codex 分担 | Harness | Harness | Harness | Harness cycle | 较低 | 高 | 稳定性逻辑集中，但固定流程侵入研究决策 |
 | v0.2 自主 Codex + 完整 Harness | Codex | Harness | Harness 强制 | Harness | Harness cycle | 高 | 高 | 研究自主性改善，但生命周期和状态机仍过重 |
-| v0.3 one-shot Listener | Codex Goal | detached Listener | Codex 主动 | Listener 只恢复一次 | 原生 Goal + 一次 `turn/start` | 最高 | 低 | 当前方案，保留闭环所需的最小外部能力 |
+| v0.3 one-shot Listener | Codex Goal | detached Listener | Listener 在提交 turn 后确认 | Listener 只激活一次 | 原生 Goal scheduler | 最高 | 低 | 当前方案，保留闭环所需的最小外部能力 |
 
 ### 11.2 长实验等待方式对比
 
@@ -246,7 +290,7 @@ v0.3 保留了历史方案中真正必要的四项工程能力：
 1. detached Worker，避免终端和 turn 断开杀死实验。
 2. 持久终态事件，避免依赖内存消息。
 3. `run_id -> thread_id` 精确绑定，避免唤醒历史会话。
-4. App Server 事件驱动恢复，避免模型轮询。
+4. App Server Goal 状态激活，避免模型轮询和外部 turn writer。
 
 同时删除了不应由外部程序拥有的研究职责：idea 调度、cycle、目标完成判断、每轮 prompt 阶段和自动修改 Goal。
 
@@ -269,6 +313,7 @@ v0.3 不再包含：
 | 能力 | 文件 |
 |---|---|
 | CLI | `src/auto_research/cli.py` |
+| 项目专用会话 | `src/auto_research/research_session.py` |
 | 配置 | `src/auto_research/config.py` |
 | detached Runner | `src/auto_research/runner.py` |
 | Worker | `src/auto_research/runner_worker.py` |
@@ -281,7 +326,9 @@ v0.3 不再包含：
 1. `start` 立即返回 run id，Worker 和 Listener 都脱离当前终端。
 2. 当前 Codex thread id 被持久化，不会绑定历史 Goal。
 3. 实验运行数小时期间没有 Codex turn 或 MCP 状态轮询。
-4. 所有终态都会触发一次恢复，包括失败和 LOST。
-5. 恢复后是同一个 thread，Listener 不创建新研究会话。
-6. Codex 再次暂停或完成后，本次 Listener 自动退出。
-7. Listener/App Server 中断后可通过 `recover-wakes` 恢复且不重复启动 turn。
+4. 提交 turn 结束后有持久 `pause_boundary_observed_at`，实验期间 Goal 保持 paused。
+5. 所有终态都会触发一次 Goal 激活，包括失败和 LOST。
+6. 激活后是同一个 thread，Listener 不创建新研究会话或 turn。
+7. `thread/goal/set(active)` 成功后 Listener 自动退出，由原生 Goal scheduler 继续。
+8. Listener/App Server 中断后可通过 `recover-wakes` 恢复且不重复激活 Goal。
+9. 同一项目重复执行 `session --create-thread` 只产生一个 thread；状态损坏、cwd 不符和并发创建均不能产生静默副本。

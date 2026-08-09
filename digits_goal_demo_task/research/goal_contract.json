@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "goal_id": "digits-goal-wake-demo-001",
+  "statement": "在不可改变的 sklearn digits 数据集、固定分层 75/25 切分和 seed=42 评估协议上，使用仅依赖训练集作出的模型选择，把最终 metrics.json 中的测试集 accuracy 从基线 0.9777777777777777 提升到至少 0.988；同时报告训练时间，并以持久化 run、终态事件和 Goal 唤醒状态证明 v0.3 异步研究闭环完整工作。",
+  "primary_metric": "accuracy",
+  "direction": "maximize",
+  "secondary_metrics": [
+    "training_time_s"
+  ],
+  "baseline": {
+    "command": "python train.py",
+    "result": "baseline_metrics.json",
+    "status": "COMPLETED",
+    "accuracy": 0.9777777777777777,
+    "num_samples": 1797,
+    "num_features": 64,
+    "test_size": 0.25,
+    "seed": 42,
+    "model": "StandardScaler + LogisticRegression"
+  },
+  "search_space": {
+    "editable_paths": [
+      "train.py algorithm section"
+    ],
+    "candidate_ideas": [
+      {
+        "idea_id": "digits-training-cv-raw-rbf-svc",
+        "hypothesis": "Digits 原始像素距离保留了书写形状的局部相似性；训练集交叉验证支持的窄 RBF 核应比线性基线减少至少 5 个测试错误。",
+        "falsifier": "正式 run 的 accuracy 小于 0.988，或者训练时间超过 120 秒。"
+      },
+      {
+        "idea_id": "digits-training-cv-polynomial-svc",
+        "hypothesis": "低阶多项式核可利用像素共现关系，在 RBF 未达标时提供不同的归纳偏置。",
+        "falsifier": "训练集交叉验证不优于 RBF 候选，或正式 run 未改善最佳有效结果。"
+      },
+      {
+        "idea_id": "digits-training-only-augmentation-rbf",
+        "hypothesis": "只对训练图像做轻微平移增强可提升边缘书写样本的鲁棒性。",
+        "falsifier": "训练集嵌套验证没有稳定收益，或正式 run 未达到挑战门槛。"
+      }
+    ],
+    "selected_idea": "digits-training-cv-raw-rbf-svc",
+    "selection_evidence": {
+      "protocol": "仅在固定 X_train/y_train 上使用 5-fold StratifiedKFold(shuffle=True, random_state=42)，未读取 X_test/y_test 指标。",
+      "candidate": "SVC(C=10, kernel='rbf', gamma=0.0007)",
+      "mean_cv_accuracy": 0.992573,
+      "cv_std": 0.005251,
+      "comparison": "优于 raw RBF gamma=0.001 的 0.990343、scaled RBF 的 0.979210 和 distance-weighted KNN 的 0.974022。"
+    },
+    "sealed_paths": [
+      "goal.json",
+      "baseline_metrics.json",
+      "research/goal_contract.json",
+      "sklearn dataset",
+      "train/test split and final metric code"
+    ]
+  },
+  "constraints": {
+    "max_wall_time_s": 120,
+    "max_peak_vram_mb": 0,
+    "test_set_use": "测试集标签只能用于每个已固定候选的一次最终评估，不得用于候选选择、超参数选择或阈值调节。",
+    "one_active_experiment": true,
+    "one_experiment_per_turn": true,
+    "max_experiments": 3
+  },
+  "stopping": {
+    "target_metric": 0.988,
+    "max_experiments": 3,
+    "plateau_window": 2,
+    "max_consecutive_failures": 2,
+    "metric_noise_threshold": 0.001,
+    "success_condition": "一个协议有效且状态为 COMPLETED 的 run 在 metrics.json 中报告 accuracy >= 0.988。",
+    "fallback": "三次正式实验后仍未达标时，报告最佳有效结果、失败分类、瓶颈与可复现实验证据，不降低门槛。"
+  },
+  "hard_requirements": [
+    {
+      "metric": "accuracy",
+      "operator": ">=",
+      "value": 0.988
+    }
+  ],
+  "protocol_requirements": [
+    "必须使用 sklearn.datasets.load_digits() 原始数据。",
+    "必须保持 train_test_split(test_size=0.25, random_state=42, stratify=dataset.target)。",
+    "模型和超参数选择只能使用训练集；测试集只用于候选固定后的最终一次预测与 accuracy 计算。",
+    "每个正式实验必须由 auto-research detached Worker 启动并产出可解析的 metrics.json 与唯一终态事件。",
+    "同一时刻只能存在一个未终态实验；RUNNING 期间 Codex 不得循环查询实验状态。",
+    "不得修改 goal.json、baseline_metrics.json、goal_contract.json、数据与评估协议来宣称达标。"
+  ],
+  "soft_preferences": [
+    "accuracy 达标时优先选择训练时间更短、参数更简单的候选。",
+    "基础设施失败应分类为 repair，不作为算法 idea 的反证。",
+    "固定 holdout 的结果只用于 Harness 与算法基准验证，不外推为生产泛化能力。"
+  ],
+  "rejected_requirements": [
+    {
+      "requirement": "直接沿用旧 digits_task 的 0.99 门槛和历史测试反馈继续调参",
+      "reason": "旧任务已经多次查看同一测试集结果，继续据此选参会加重测试集污染；本任务使用全新研究目录和训练集 CV 证据。"
+    },
+    {
+      "requirement": "把高于基线任意微小提升都视为目标完成",
+      "reason": "无法充分验证自动研究确实取得有意义的算法改善，因此设置 accuracy >= 0.988 的硬门槛。"
+    },
+    {
+      "requirement": "实验运行时让 Codex 持续轮询",
+      "reason": "v0.3 的目标正是由本地 Listener 接收终态后恢复 Goal，RUNNING 轮询会浪费 token。"
+    }
+  ],
+  "reasoning_summary": "用户要求验证当前方案的完整目标闭环，因此目标同时包含算法验收与运行链路证据。Digits 数据集无下载依赖、运行快且旧基线明确；0.988 对应最多 5/450 个测试错误，相比基线 10/450 个错误至少减半，具有明确而不过度承诺的挑战性。首个候选不是由测试集结果选出，而是由训练集五折交叉验证在多种归纳偏置中筛选，正式 holdout 结果仍保留可证伪性。"
+}

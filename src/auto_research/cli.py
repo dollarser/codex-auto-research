@@ -18,6 +18,28 @@ def main(argv: list[str] | None = None) -> int:
     init = sub.add_parser("init", help="create goal.json and research/config.toml")
     init.add_argument("project", nargs="?", default=".")
 
+    session = sub.add_parser(
+        "session",
+        help="create once or reuse the project's dedicated Codex research task",
+    )
+    session.add_argument("--project", default=".")
+    session.add_argument(
+        "--create-thread",
+        action="store_true",
+        help="create a project-bound task only when no binding exists",
+    )
+    session.add_argument(
+        "--thread-id",
+        help="bind an existing project task instead of creating one",
+    )
+    session.add_argument("--title")
+    session.add_argument("--objective")
+    session.add_argument(
+        "--replace-goal",
+        action="store_true",
+        help="allow --objective to replace an existing different Goal",
+    )
+
     start = sub.add_parser(
         "start", help="start a detached experiment and arm Goal wake-up"
     )
@@ -96,10 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         if not config_path.exists():
             config_path.parent.mkdir(parents=True, exist_ok=True)
             config_path.write_text(
-                '[codex]\nmodel = "gpt-5.6-luna"\nreasoning_effort = "medium"\n'
-                'sandbox = "danger-full-access"\napproval_policy = "never"\n\n'
                 "[listener]\nauto_wake = true\napp_server_response_timeout_s = 60.0\n"
-                "resumed_turn_timeout_s = 14400.0\nbind_recency_s = 600.0\n"
+                "bind_recency_s = 600.0\n"
                 "reconnect_initial_s = 2.0\nreconnect_max_s = 60.0\n"
                 "event_poll_s = 0.25\nevent_grace_s = 30.0\n\n"
                 '[experiment]\nuse_shell = true\nallowed_executables = ["python", "python3"]\n'
@@ -108,6 +128,19 @@ def main(argv: list[str] | None = None) -> int:
                 encoding="utf-8",
             )
         _print({"goal": str(goal_path), "config": str(config_path)})
+        return 0
+
+    if args.action == "session":
+        from .research_session import ResearchSessionManager
+
+        result = ResearchSessionManager(args.project).prepare(
+            create_thread=args.create_thread,
+            thread_id=args.thread_id,
+            objective=args.objective,
+            title=args.title,
+            replace_goal=args.replace_goal,
+        )
+        _print(result)
         return 0
 
     if args.action == "start":

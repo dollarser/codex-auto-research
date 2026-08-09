@@ -200,3 +200,20 @@ ps -axo pid,etime,command | rg 'goal-harness|app-server|auto_research.mcp' || tr
 ```
 
 当前关键不变量：一个 Harness cycle 最多提交一个实验；长实验不依赖 Codex/MCP 轮询；所有实验最终落盘 terminal event；状态统计可从 runs 目录重建。
+
+## v0.3 真实闭环验证补充
+
+### 独立 App Server 与桌面端争抢 thread writer
+
+问题：v0.3 初版 Listener 在终态后依次调用 `thread/resume`、`thread/goal/set(active)` 和 `turn/start`。真实 digits Goal 验证中，算法 run 已正常 `COMPLETED`，但桌面端仍拥有同一 thread 的 writer，Listener 连续收到 `thread ... already has an active writer`，停在 `WAKE_RETRY`。这证明“外部 Listener 自建恢复 turn”仍保留了不必要的执行所有权。
+
+修复：Listener 现在只核对持久 Goal/thread 状态并调用 `thread/goal/set(status=active)`，写入 `ACTIVATED` 后退出。continuation turn 完全由原生 Goal scheduler 创建；同时删除 Listener 中的 `thread/resume`、`turn/start`、长 turn 等待，以及已经没有作用的 Codex 模型、reasoning effort、sandbox、approval 和 resumed-turn timeout 配置。
+
+后续核对同一 session 又发现：在活跃提交 turn 内写入 paused 虽然 RPC 成功，但 turn finalization 仍可能发布最新 Goal usage/state并触发原生 continuation。Listener 因此在启动时记录 Goal usage、请求 paused，并等待提交 turn 的 usage 或状态发生持久变化后再次确认 paused；只有完成该 `PAUSE_HANDOFF` 才进入实验等待。终态后再写 active，形成完整的 paused/active 双边桥。
+
+验证：`test_wake_listener_binds_explicit_thread_and_wakes_once` 断言只发生一次 Goal 激活且没有 resume/turn 调用；真实验证任务位于 `digits_goal_demo_task/`。
+## v0.3：项目专用会话只创建一次
+
+问题：完全禁止当前版本创建 thread 可以杜绝历史重复会话，却要求用户先手动建 task、查找 thread id 并完成绑定；如果简单恢复 `thread/start`，重试、并发启动或初始化中途失败又可能重新制造多个空 Goal task。
+
+修复：新增独立 Session Bootstrap 和 `auto-research session`。只有显式 `--create-thread` 才允许缺失时创建；`research/codex_session.json` 与文件锁保证重复调用和并发调用复用同一 thread。取得 thread id 后先持久化，再命名和初始化 paused Goal。已有 task 可由 `--thread-id` 采用；状态损坏、项目 cwd 不符、当前 task 与专用 task 不一致时均失败关闭。Listener 仍不调用 `thread/start` 或 `turn/start`。

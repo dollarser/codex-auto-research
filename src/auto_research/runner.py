@@ -98,6 +98,7 @@ class ExperimentRunner:
         hard_requirements_snapshot: list[dict[str, Any]] | None = None,
         wake_enabled: bool = False,
         codex_thread_id: str | None = None,
+        pause_goal_on_turn_end: bool = False,
     ) -> str:
         with _terminal_lock(self.runs_dir):
             if idempotency_key:
@@ -136,6 +137,7 @@ class ExperimentRunner:
                 "runtime_version": 3,
                 "wake_enabled": wake_enabled,
                 "codex_thread_id": codex_thread_id,
+                "pause_goal_on_turn_end": pause_goal_on_turn_end,
                 "created_at": time.time(),
                 "status": "SUBMITTED",
                 "worker_heartbeat_s": config.worker_heartbeat_s,

@@ -11,6 +11,7 @@ research/state/
 **/research/*.log
 **/research/*.lock
 **/research/active_*.json
+**/research/codex_session.json
 **/research/goal_harness.json
 **/research/goal_decision.json
 **/research/goal_decision_error.json

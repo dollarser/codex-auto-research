@@ -1,4 +1,4 @@
-"""Minimal Codex App Server client used only to wake one persisted Goal."""
+"""Minimal Codex App Server client used to inspect and activate one Goal."""
 
 from __future__ import annotations
 
@@ -23,31 +23,21 @@ class AppServerTimeout(AppServerError):
     pass
 
 
-def _turn_id(message: dict[str, Any]) -> str | None:
-    params = message.get("params", {})
-    if not isinstance(params, dict):
-        return None
-    direct = params.get("turnId")
-    if isinstance(direct, str):
-        return direct
-    turn = params.get("turn")
-    return (
-        turn.get("id")
-        if isinstance(turn, dict) and isinstance(turn.get("id"), str)
-        else None
-    )
-
-
 class AppServerClient:
-    """Dependency-free JSONL client for the small wake-up protocol surface."""
+    """Dependency-free JSONL client for the small Goal-state surface."""
 
-    QUIESCENT_GOAL_STATUSES = frozenset(
-        {"paused", "blocked", "usageLimited", "budgetLimited", "complete"}
-    )
-
-    def __init__(self, cwd: str | Path, config: ResearchConfig | None = None):
+    def __init__(
+        self,
+        cwd: str | Path,
+        config: ResearchConfig | None = None,
+        *,
+        client_name: str = "auto-research-goal-wake-listener",
+        client_version: str = "0.3.0",
+    ):
         self.cwd = str(Path(cwd).resolve())
         self.config = config or load_config(self.cwd)
+        self.client_name = client_name
+        self.client_version = client_version
         self._next_id = 1
         self._pending: deque[dict[str, Any]] = deque()
         self._stderr: deque[str] = deque(maxlen=100)
@@ -184,8 +174,8 @@ class AppServerClient:
             "initialize",
             {
                 "clientInfo": {
-                    "name": "auto-research-goal-wake-listener",
-                    "version": "0.3.0",
+                    "name": self.client_name,
+                    "version": self.client_version,
                 }
             },
         )
@@ -212,13 +202,6 @@ class AppServerClient:
             if not isinstance(cursor, str) or not cursor:
                 return threads
 
-    def resume_thread(self, thread_id: str) -> dict[str, Any]:
-        response = self._response(self._send("thread/resume", {"threadId": thread_id}))
-        thread = response.get("result", {}).get("thread", {})
-        if not isinstance(thread, dict):
-            raise AppServerError("thread/resume did not return a thread")
-        return thread
-
     def read_thread(self, thread_id: str) -> dict[str, Any]:
         response = self._response(
             self._send("thread/read", {"threadId": thread_id, "includeTurns": False})
@@ -228,6 +211,23 @@ class AppServerClient:
             raise AppServerError("thread/read did not return a thread")
         return thread
 
+    def start_thread(self, *, service_name: str) -> dict[str, Any]:
+        response = self._response(
+            self._send(
+                "thread/start",
+                {"cwd": self.cwd, "serviceName": service_name},
+            )
+        )
+        thread = response.get("result", {}).get("thread", {})
+        if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
+            raise AppServerError("thread/start did not return a thread id")
+        return thread
+
+    def set_thread_name(self, thread_id: str, name: str) -> None:
+        self._response(
+            self._send("thread/name/set", {"threadId": thread_id, "name": name})
+        )
+
     def get_goal(self, thread_id: str) -> dict[str, Any] | None:
         response = self._response(
             self._send("thread/goal/get", {"threadId": thread_id})
@@ -235,96 +235,30 @@ class AppServerClient:
         goal = response.get("result", {}).get("goal")
         return goal if isinstance(goal, dict) else None
 
-    def set_goal_status(self, thread_id: str, status: str) -> dict[str, Any]:
-        response = self._response(
-            self._send("thread/goal/set", {"threadId": thread_id, "status": status})
-        )
+    def set_goal(
+        self,
+        thread_id: str,
+        *,
+        objective: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"threadId": thread_id}
+        if objective is not None:
+            params["objective"] = objective
+        if status is not None:
+            params["status"] = status
+        response = self._response(self._send("thread/goal/set", params))
         goal = response.get("result", {}).get("goal", {})
-        if not isinstance(goal, dict) or goal.get("status") != status:
+        if not isinstance(goal, dict):
+            raise AppServerError("thread/goal/set did not return a Goal")
+        if status is not None and goal.get("status") != status:
             raise AppServerError(f"Goal did not enter {status!r}")
+        if objective is not None and goal.get("objective") != objective:
+            raise AppServerError("Goal objective was not persisted")
         return goal
 
-    def start_turn(self, thread_id: str, prompt: str) -> str:
-        sandbox_type = (
-            "dangerFullAccess"
-            if self.config.codex_sandbox == "danger-full-access"
-            else "workspaceWrite"
-        )
-        params: dict[str, Any] = {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
-            "cwd": self.cwd,
-            "approvalPolicy": self.config.codex_approval,
-            "sandboxPolicy": {"type": sandbox_type},
-        }
-        if self.config.codex_model:
-            params["model"] = self.config.codex_model
-        if self.config.codex_reasoning_effort:
-            params["effort"] = self.config.codex_reasoning_effort
-        response = self._response(self._send("turn/start", params))
-        turn = response.get("result", {}).get("turn", {})
-        turn_id = turn.get("id") if isinstance(turn, dict) else None
-        if not isinstance(turn_id, str) or not turn_id:
-            raise AppServerError("turn/start did not return a turn id")
-        return turn_id
-
-    def wait_until_goal_quiescent(self, thread_id: str, initial_turn_id: str) -> str:
-        """Keep the execution host alive until Codex pauses or completes its Goal."""
-        deadline = time.monotonic() + self.config.resumed_turn_timeout_s
-        active_turns = {initial_turn_id}
-        quiescent_status: str | None = None
-        quiescent_since: float | None = None
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AppServerTimeout(
-                    f"resumed Goal did not become quiescent within {self.config.resumed_turn_timeout_s:.1f}s"
-                )
-            read_timeout = min(remaining, 30.0) if quiescent_status else remaining
-            try:
-                message = self._message(
-                    read_timeout, f"Goal {thread_id} to become quiescent"
-                )
-            except AppServerTimeout:
-                if quiescent_status and quiescent_since is not None:
-                    # Some App Server builds omit turn/completed after the Goal
-                    # itself has durably paused. Give the turn a bounded flush
-                    # window, then preserve the durable Goal state and exit.
-                    return quiescent_status
-                raise
-            if self._handle_server_request(message):
-                continue
-            method = message.get("method")
-            params = message.get("params", {})
-            if method == "thread/goal/updated" and isinstance(params, dict):
-                goal = params.get("goal", {})
-                status = goal.get("status") if isinstance(goal, dict) else None
-                if status in self.QUIESCENT_GOAL_STATUSES:
-                    quiescent_status = str(status)
-                    quiescent_since = quiescent_since or time.monotonic()
-            if method == "turn/started":
-                found = _turn_id(message)
-                if found:
-                    active_turns.add(found)
-            if method == "turn/completed":
-                active_turns.discard(_turn_id(message))
-                goal = self.get_goal(thread_id)
-                status = goal.get("status") if goal else None
-                if status in self.QUIESCENT_GOAL_STATUSES:
-                    quiescent_status = str(status)
-                    quiescent_since = quiescent_since or time.monotonic()
-                # An active Goal may schedule another native turn. Keep this
-                # App Server process alive, but do not create or poll turns.
-            if method == "item/completed" and isinstance(params, dict):
-                item = params.get("item", {})
-                if (
-                    isinstance(item, dict)
-                    and item.get("type") == "agentMessage"
-                    and item.get("phase") == "final_answer"
-                ):
-                    active_turns.discard(_turn_id(message))
-            if quiescent_status and not active_turns:
-                return quiescent_status
+    def set_goal_status(self, thread_id: str, status: str) -> dict[str, Any]:
+        return self.set_goal(thread_id, status=status)
 
     def close(self) -> None:
         if self.process.poll() is None:

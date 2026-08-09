@@ -1,0 +1,42 @@
+{
+  "goal_id": "digits-goal-wake-demo-001",
+  "statement": "在固定 sklearn digits 评估协议下，以不泄漏测试集的方式将分类准确率从 0.97778 提升到至少 0.988，同时保留可复现的运行证据并验证 Codex Goal 的异步暂停和终态唤醒闭环。",
+  "primary_metric": "accuracy",
+  "direction": "maximize",
+  "secondary_metrics": [
+    "training_time_s"
+  ],
+  "baseline": {
+    "command": "python train.py",
+    "result": "baseline_metrics.json"
+  },
+  "search_space": {
+    "editable_paths": [
+      "train.py algorithm section"
+    ],
+    "sealed_paths": [
+      "goal.json",
+      "baseline_metrics.json",
+      "research/goal_contract.json",
+      "dataset and evaluation protocol"
+    ]
+  },
+  "constraints": {
+    "max_wall_time_s": 120,
+    "max_peak_vram_mb": 0
+  },
+  "stopping": {
+    "target_metric": 0.988,
+    "max_experiments": 3,
+    "plateau_window": 2,
+    "max_consecutive_failures": 2,
+    "metric_noise_threshold": 0.001
+  },
+  "hard_requirements": [
+    {
+      "metric": "accuracy",
+      "operator": ">=",
+      "value": 0.988
+    }
+  ]
+}

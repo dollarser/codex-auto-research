@@ -46,7 +46,7 @@ def _now() -> float:
 
 
 class GoalWakeListener:
-    """Wait for one run, wake its exact Goal, then exit when Goal pauses again."""
+    """Wait for one run, reactivate its exact persisted Goal, then exit."""
 
     def __init__(
         self,
@@ -223,18 +223,28 @@ class GoalWakeListener:
                 time.sleep(delay)
                 delay = min(self.config.reconnect_max_s, delay * 2)
 
-    def _wake_once(self, thread_id: str, terminal_status: str) -> dict[str, Any]:
-        state = self._state()
-        existing_turn_id = state.get("wake_turn_id")
-        client = self.client_factory()
-        try:
+    def _activate_goal_once(
+        self, thread_id: str, terminal_status: str
+    ) -> dict[str, Any]:
+        """Reactivate the native Goal scheduler without owning a Codex turn.
+
+        The desktop client may already own the thread writer.  A second App
+        Server can still update persisted Goal state, but `thread/resume` or
+        `turn/start` would race that writer and can create duplicate execution
+        hosts.  The Goal scheduler is the sole owner of continuation turns.
+        """
+        with self.client_factory() as client:
             client.initialize()
-            client.resume_thread(thread_id)
             goal = client.get_goal(thread_id)
             if not goal:
                 raise GoalBindingError(f"thread {thread_id} no longer has a Goal")
             goal_status = goal.get("status")
-            if goal_status in {"complete", "blocked", "usageLimited", "budgetLimited"}:
+            if goal_status in {
+                "complete",
+                "blocked",
+                "usageLimited",
+                "budgetLimited",
+            }:
                 return self._save(
                     state="SKIPPED",
                     reason=f"Goal is {goal_status}; listener will not reactivate it",
@@ -242,67 +252,198 @@ class GoalWakeListener:
                     finished_at=_now(),
                 )
 
-            thread = client.read_thread(thread_id)
-            thread_status = thread.get("status", {})
-            runtime_type = (
-                thread_status.get("type") if isinstance(thread_status, dict) else None
-            )
-            if runtime_type == "active" and not existing_turn_id:
-                # A user or another listener already resumed this task. Starting
-                # another turn would duplicate the result analysis.
+            if goal_status == "active":
                 return self._save(
                     state="SKIPPED",
-                    reason="thread is already active; assuming it was resumed elsewhere",
+                    reason="Goal is already active; continuation is already owned elsewhere",
                     terminal_status=terminal_status,
                     finished_at=_now(),
                 )
 
-            if goal_status == "paused":
-                client.set_goal_status(thread_id, "active")
-
-            if (
-                isinstance(existing_turn_id, str)
-                and existing_turn_id
-                and runtime_type == "active"
-            ):
-                turn_id = existing_turn_id
-            else:
-                prompt = (
-                    f"后台实验 {self.run_id} 已进入终态 {terminal_status}。"
-                    f"请读取 {self.run_dir}/events/ 下的终态事件、metrics.json 和日志，"
-                    "继续当前 Goal 的自主研究：分析结果、更新历史、决定完成或选择下一个 idea。"
-                    "如果启动下一次实验，请使用已配置的 auto-research start 或 Experiment MCP；"
-                    "它会自动注册新的唤醒监听器。确认新实验稳定后台运行后暂停 Goal，"
-                    "不要轮询 RUNNING 状态。"
-                )
-                self._save(
-                    state="WAKING", terminal_status=terminal_status, last_error=None
-                )
-                turn_id = client.start_turn(thread_id, prompt)
-                self._save(
-                    state="GOAL_RUNNING",
-                    wake_turn_id=turn_id,
-                    wake_started_at=_now(),
-                    terminal_status=terminal_status,
-                )
-
-            final_goal_status = client.wait_until_goal_quiescent(thread_id, turn_id)
+            self._save(
+                state="ACTIVATING", terminal_status=terminal_status, last_error=None
+            )
+            activated = client.set_goal_status(thread_id, "active")
             return self._save(
-                state="WOKEN",
-                goal_status=final_goal_status,
+                state="ACTIVATED",
+                goal_status=activated.get("status"),
+                activated_at=_now(),
                 finished_at=_now(),
                 last_error=None,
             )
-        finally:
-            client.close()
+
+    @staticmethod
+    def _goal_usage(goal: dict[str, Any]) -> tuple[int | None, float | None]:
+        tokens = goal.get("tokensUsed")
+        updated = goal.get("updatedAt")
+        return (
+            int(tokens)
+            if isinstance(tokens, (int, float)) and not isinstance(tokens, bool)
+            else None,
+            float(updated)
+            if isinstance(updated, (int, float)) and not isinstance(updated, bool)
+            else None,
+        )
+
+    def _pause_goal_after_current_turn(self, thread_id: str) -> dict[str, Any]:
+        """Hold the Goal paused across the turn-finalization boundary.
+
+        Setting a Goal to paused does not interrupt the turn that submitted the
+        experiment.  That turn may publish updated Goal usage/state when it
+        finishes, so the listener waits for that durable boundary and then
+        reasserts paused before it begins the long experiment wait.
+        """
+        run = self.runner.get_run(self.run_id)
+        if not run.get("pause_goal_on_turn_end"):
+            return self._save(state="WAITING", pause_mode="not_requested")
+
+        with self.client_factory() as client:
+            client.initialize()
+            goal = client.get_goal(thread_id)
+            if not goal:
+                raise GoalBindingError(f"thread {thread_id} no longer has a Goal")
+            if goal.get("status") in {
+                "complete",
+                "blocked",
+                "usageLimited",
+                "budgetLimited",
+            }:
+                return self._save(
+                    state="SKIPPED",
+                    reason=f"Goal is {goal.get('status')}; listener will not manage it",
+                    finished_at=_now(),
+                )
+
+            state = self._state()
+            original_tokens, original_updated = self._goal_usage(goal)
+            persisted_tokens = state.get("pause_baseline_tokens")
+            persisted_updated = state.get("pause_baseline_updated_at")
+            baseline_tokens = (
+                int(persisted_tokens)
+                if isinstance(persisted_tokens, (int, float))
+                and not isinstance(persisted_tokens, bool)
+                else original_tokens
+            )
+            baseline_updated = (
+                float(persisted_updated)
+                if isinstance(persisted_updated, (int, float))
+                and not isinstance(persisted_updated, bool)
+                else original_updated
+            )
+            if state.get("pause_boundary_detected_at"):
+                confirmed = client.set_goal_status(thread_id, "paused")
+                return self._save(
+                    state="WAITING",
+                    pause_mode="turn_boundary_recovered",
+                    pause_boundary_observed_at=state["pause_boundary_detected_at"],
+                    pause_confirmed_status=confirmed.get("status"),
+                    last_error=None,
+                )
+
+            already_advanced = (
+                baseline_tokens is not None
+                and original_tokens is not None
+                and original_tokens > baseline_tokens
+            )
+            already_overwritten = (
+                state.get("state") in {"PAUSE_HANDOFF", "PAUSE_RETRY"}
+                and goal.get("status") != "paused"
+            )
+            if already_advanced or already_overwritten:
+                detected_at = _now()
+                self._save(
+                    state="PAUSE_BOUNDARY_DETECTED",
+                    pause_boundary_detected_at=detected_at,
+                    pause_boundary_reason=(
+                        "usage_advanced" if already_advanced else "status_overwritten"
+                    ),
+                )
+                confirmed = client.set_goal_status(thread_id, "paused")
+                return self._save(
+                    state="WAITING",
+                    pause_mode="turn_boundary_recovered",
+                    pause_boundary_observed_at=detected_at,
+                    pause_confirmed_status=confirmed.get("status"),
+                    last_error=None,
+                )
+
+            paused = client.set_goal_status(thread_id, "paused")
+            paused_tokens, paused_updated = self._goal_usage(paused)
+            baseline_tokens = (
+                baseline_tokens if baseline_tokens is not None else paused_tokens
+            )
+            baseline_updated = (
+                baseline_updated if baseline_updated is not None else paused_updated
+            )
+            self._save(
+                state="PAUSE_HANDOFF",
+                pause_requested_at=_now(),
+                pause_baseline_tokens=baseline_tokens,
+                pause_baseline_updated_at=baseline_updated,
+                last_error=None,
+            )
+
+            while True:
+                time.sleep(max(self.config.event_poll_s, 0.1))
+                current = client.get_goal(thread_id)
+                if not current:
+                    raise GoalBindingError(
+                        f"thread {thread_id} lost its Goal during pause handoff"
+                    )
+                status = current.get("status")
+                if status in {
+                    "complete",
+                    "blocked",
+                    "usageLimited",
+                    "budgetLimited",
+                }:
+                    return self._save(
+                        state="SKIPPED",
+                        reason=f"Goal became {status} during pause handoff",
+                        finished_at=_now(),
+                    )
+                tokens, updated = self._goal_usage(current)
+                usage_advanced = (
+                    baseline_tokens is not None
+                    and tokens is not None
+                    and tokens > baseline_tokens
+                )
+                state_overwritten = status != "paused"
+                if usage_advanced or state_overwritten:
+                    detected_at = _now()
+                    reason = (
+                        "usage_advanced" if usage_advanced else "status_overwritten"
+                    )
+                    self._save(
+                        state="PAUSE_BOUNDARY_DETECTED",
+                        pause_boundary_detected_at=detected_at,
+                        pause_boundary_reason=reason,
+                    )
+                    confirmed = client.set_goal_status(thread_id, "paused")
+                    return self._save(
+                        state="WAITING",
+                        pause_mode="turn_boundary",
+                        pause_boundary_observed_at=detected_at,
+                        pause_boundary_reason=reason,
+                        pause_confirmed_status=confirmed.get("status"),
+                        pause_confirmed_tokens=tokens,
+                        pause_confirmed_updated_at=updated,
+                        last_error=None,
+                    )
 
     def run(self) -> dict[str, Any]:
         with _listener_lock(self.run_dir / ".wake-listener.lock"):
             state = self._state()
-            if state.get("state") in {"WOKEN", "SKIPPED"}:
+            if state.get("state") in {"ACTIVATED", "SKIPPED"}:
                 return state
             self._save(state="BINDING", listener_pid=os.getpid(), started_at=_now())
             thread_id = self._retry("BINDING_RETRY", self._bind_once)
+            pause_state = self._retry(
+                "PAUSE_RETRY",
+                lambda: self._pause_goal_after_current_turn(thread_id),
+            )
+            if pause_state.get("state") == "SKIPPED":
+                return pause_state
             result = self.runner.wait(
                 self.run_id,
                 poll_s=self.config.event_poll_s,
@@ -315,8 +456,8 @@ class GoalWakeListener:
                 terminal_at=_now(),
             )
             return self._retry(
-                "WAKE_RETRY",
-                lambda: self._wake_once(thread_id, result.status),
+                "ACTIVATION_RETRY",
+                lambda: self._activate_goal_once(thread_id, result.status),
             )
 
 
@@ -380,7 +521,7 @@ def recover_wake_listeners(project_dir: str | Path) -> list[dict[str, Any]]:
             # Never attach the v0.3 listener to pre-v0.3 historical runs.
             continue
         wake = read_json(run_file.parent / "wake.json", {}) or {}
-        if wake.get("state") in {"WOKEN", "SKIPPED"}:
+        if wake.get("state") in {"ACTIVATED", "SKIPPED"}:
             continue
         thread_id = wake.get("thread_id")
         recovered.append(

@@ -18,6 +18,7 @@ from typing import Any
 from .config import load_config
 from .ledger import read_json, write_json_atomic
 from .models import GoalSpec
+from .research_session import read_bound_thread_id
 from .runner import ExperimentRunner
 
 
@@ -166,7 +167,25 @@ class ExperimentService:
             raise ValueError("timeout_s must be between 1 and 604800")
         resolved = self._worktree(worktree)
         snapshot = self._goal_contract_snapshot()
-        thread_id = thread_id or os.environ.get("CODEX_THREAD_ID") or None
+        environment_thread_id = os.environ.get("CODEX_THREAD_ID") or None
+        bound_thread_id = read_bound_thread_id(self.project_dir)
+        if thread_id and environment_thread_id and thread_id != environment_thread_id:
+            raise ValueError(
+                "thread_id does not match the current CODEX_THREAD_ID; refusing "
+                "to wake a task that did not submit this experiment"
+            )
+        selected_thread_id = thread_id or environment_thread_id or bound_thread_id
+        if (
+            bound_thread_id
+            and selected_thread_id
+            and selected_thread_id != bound_thread_id
+        ):
+            raise ValueError(
+                f"project is bound to dedicated thread {bound_thread_id}, but the "
+                f"experiment was submitted from {selected_thread_id}; open the "
+                "dedicated task or remove the project binding intentionally"
+            )
+        thread_id = selected_thread_id
         with self._submission_lock():
             if self.config.one_active_experiment:
                 active_run_id = self._active_run_id()
@@ -187,6 +206,9 @@ class ExperimentService:
                 hard_requirements_snapshot=snapshot.get("hard_requirements", []),
                 wake_enabled=self.config.auto_wake,
                 codex_thread_id=thread_id,
+                pause_goal_on_turn_end=bool(
+                    environment_thread_id and thread_id == environment_thread_id
+                ),
             )
             if self.config.one_active_experiment:
                 write_json_atomic(self.active_submission_path, {"run_id": run_id})

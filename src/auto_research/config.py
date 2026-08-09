@@ -9,11 +9,6 @@ from pathlib import Path
 import tomllib
 
 DEFAULT_ALLOWED_EXECUTABLES = {"python", "python3"}
-DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
-DEFAULT_CODEX_REASONING_EFFORT = "medium"
-REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
-
-
 def _env(name: str) -> str | None:
     value = os.environ.get(name)
     return value.strip() if value is not None and value.strip() else None
@@ -51,12 +46,7 @@ def _float(value: object, name: str, minimum: float = 0.0) -> float:
 
 @dataclass(frozen=True)
 class ResearchConfig:
-    codex_model: str = DEFAULT_CODEX_MODEL
-    codex_reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT
-    codex_sandbox: str = "danger-full-access"
-    codex_approval: str = "never"
     app_server_response_timeout_s: float = 60.0
-    resumed_turn_timeout_s: float = 4 * 3600.0
     bind_recency_s: float = 600.0
     reconnect_initial_s: float = 2.0
     reconnect_max_s: float = 60.0
@@ -79,29 +69,12 @@ def load_config(project_dir: str | Path) -> ResearchConfig:
     if path.exists():
         with path.open("rb") as stream:
             file_data = tomllib.load(stream)
-    codex = file_data.get("codex", {})
     listener = file_data.get("listener", {})
     experiment = file_data.get("experiment", {})
 
     def value(section: dict, key: str, env_name: str, default: object) -> object:
         override = _env(env_name)
         return override if override is not None else section.get(key, default)
-
-    model = str(
-        value(codex, "model", "AUTO_RESEARCH_CODEX_MODEL", DEFAULT_CODEX_MODEL)
-    ).strip()
-    effort = str(
-        value(
-            codex,
-            "reasoning_effort",
-            "AUTO_RESEARCH_CODEX_REASONING_EFFORT",
-            DEFAULT_CODEX_REASONING_EFFORT,
-        )
-    ).strip()
-    if effort not in REASONING_EFFORTS:
-        raise ValueError(
-            f"codex.reasoning_effort must be one of: {', '.join(sorted(REASONING_EFFORTS))}"
-        )
 
     configured_allowlist = value(
         experiment,
@@ -123,16 +96,6 @@ def load_config(project_dir: str | Path) -> ResearchConfig:
         raise ValueError("experiment.allowed_executables must not be empty")
 
     return ResearchConfig(
-        codex_model=model or DEFAULT_CODEX_MODEL,
-        codex_reasoning_effort=effort,
-        codex_sandbox=str(
-            value(codex, "sandbox", "AUTO_RESEARCH_CODEX_SANDBOX", "danger-full-access")
-        ).strip()
-        or "danger-full-access",
-        codex_approval=str(
-            value(codex, "approval_policy", "AUTO_RESEARCH_CODEX_APPROVAL", "never")
-        ).strip()
-        or "never",
         app_server_response_timeout_s=_float(
             value(
                 listener,
@@ -141,16 +104,6 @@ def load_config(project_dir: str | Path) -> ResearchConfig:
                 60.0,
             ),
             "listener.app_server_response_timeout_s",
-            1.0,
-        ),
-        resumed_turn_timeout_s=_float(
-            value(
-                listener,
-                "resumed_turn_timeout_s",
-                "AUTO_RESEARCH_RESUMED_TURN_TIMEOUT_S",
-                4 * 3600.0,
-            ),
-            "listener.resumed_turn_timeout_s",
             1.0,
         ),
         bind_recency_s=_float(

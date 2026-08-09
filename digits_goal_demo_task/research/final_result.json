@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "goal_id": "digits-goal-wake-demo-001",
+  "decision": "achieved",
+  "hard_requirements_passed": true,
+  "primary_metric": {
+    "name": "accuracy",
+    "operator": ">=",
+    "target": 0.988,
+    "baseline": 0.9777777777777777,
+    "achieved": 0.9911111111111112,
+    "absolute_improvement": 0.01333333333333342
+  },
+  "selected_idea": {
+    "idea_id": "digits-training-cv-raw-rbf-svc",
+    "model": "SVC",
+    "params": {
+      "C": 10.0,
+      "kernel": "rbf",
+      "gamma": 0.0007
+    },
+    "selection_protocol": "5-fold StratifiedKFold on X_train/y_train only",
+    "mean_cv_accuracy": 0.992573,
+    "cv_std": 0.005251
+  },
+  "evidence_runs": [
+    {
+      "run_id": "run-digits-training-cv-raw-rbf-svc-f1ae8032",
+      "status": "COMPLETED",
+      "accuracy": 0.9911111111111112,
+      "classification": "promote_algorithm_repair_wake_bridge",
+      "note": "The algorithm passed, but the original Listener exposed an independent App Server writer conflict."
+    },
+    {
+      "run_id": "run-digits-training-cv-raw-rbf-svc-replication-32667f80",
+      "status": "COMPLETED",
+      "accuracy": 0.9911111111111112,
+      "training_time_s": 0.023750167340040207,
+      "classification": "promote_replicated",
+      "wake_state": "ACTIVATED",
+      "pause_boundary_reason": "status_overwritten",
+      "note": "Replicated the metric and verified PAUSE_HANDOFF -> WAITING -> TERMINAL -> ACTIVATED on the same Goal thread."
+    }
+  ],
+  "protocol_evidence": {
+    "dataset": "sklearn.datasets.load_digits",
+    "test_size": 0.25,
+    "seed": 42,
+    "stratified": true,
+    "test_set_selection": false,
+    "goal_contract_revision": 1,
+    "goal_contract_digest": "e99c647dba53dd0fad28a7f6cb25208da7a4312dcc647caaf34c780efc982d67"
+  },
+  "runtime_evidence": {
+    "detached_worker": true,
+    "unique_terminal_event": true,
+    "goal_paused_after_submitting_turn": true,
+    "terminal_event_reactivated_goal": true,
+    "listener_created_turn": false,
+    "model_polling_while_running": false,
+    "active_experiment_marker_cleared": true
+  },
+  "conclusion": "The fixed-protocol accuracy target was exceeded in two completed runs, and the repaired one-shot Listener completed the same-thread Goal pause/reactivation loop without owning a Codex turn."
+}
