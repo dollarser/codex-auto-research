@@ -17,6 +17,7 @@ from auto_research.supervisor import (
     GoalRuntimeSupervisor,
     SupervisorError,
     pause_goal_for_experiment,
+    supervisor_active_experiment_path,
     supervisor_dir,
 )
 
@@ -209,7 +210,7 @@ class SupervisorTests(unittest.TestCase):
             write_goal(project)
             runner, run_id = write_terminal_run(project, thread_id="desktop-thread")
             write_json_atomic(
-                project / "research" / "active_experiment.json",
+                supervisor_active_experiment_path(project),
                 {"run_id": run_id},
             )
 
@@ -244,7 +245,7 @@ class SupervisorTests(unittest.TestCase):
                 if turn_count == 1:
                     client.goal["status"] = "paused"
                     write_json_atomic(
-                        project / "research" / "active_experiment.json",
+                        supervisor_active_experiment_path(project),
                         {"run_id": run_id},
                     )
                 else:
@@ -266,7 +267,7 @@ class SupervisorTests(unittest.TestCase):
                 client.injected[0]["content"][0]["text"],
             )
             self.assertFalse(
-                (project / "research" / "active_experiment.json").exists()
+                supervisor_active_experiment_path(project).exists()
             )
 
     def test_pause_goal_handoff_uses_managed_goal_control(self):
@@ -323,6 +324,10 @@ class SupervisorTests(unittest.TestCase):
                 project,
                 wake_launcher=lambda *args, **kwargs: launches.append(args),
             )
+            write_json_atomic(
+                project / "research" / "active_experiment.json",
+                {"run_id": "foreign-desktop-run"},
+            )
             pause = {
                 "thread_id": "thread-goal",
                 "run_id": "run-test",
@@ -348,6 +353,12 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(launches, [])
             self.assertFalse(submit.call_args.kwargs["wake_enabled"])
             pause_goal.assert_called_once()
+            self.assertEqual(
+                json.loads(
+                    supervisor_active_experiment_path(project).read_text()
+                )["run_id"],
+                "run-test",
+            )
 
     def test_supervisor_owned_experiment_fails_closed_when_pause_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

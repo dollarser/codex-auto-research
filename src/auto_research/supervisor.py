@@ -53,10 +53,19 @@ def is_supervisor_thread(project_dir: str | Path, thread_id: str | None) -> bool
     )
 
 
-def active_experiment_id(project_dir: str | Path) -> str | None:
-    marker = read_json(
-        Path(project_dir).resolve() / "research" / "active_experiment.json", {}
-    ) or {}
+def supervisor_active_experiment_path(project_dir: str | Path) -> Path:
+    return supervisor_dir(project_dir) / "active_experiment.json"
+
+
+def active_experiment_id(
+    project_dir: str | Path, *, thread_id: str | None = None
+) -> str | None:
+    path = (
+        supervisor_active_experiment_path(project_dir)
+        if thread_id and is_supervisor_thread(project_dir, thread_id)
+        else Path(project_dir).resolve() / "research" / "active_experiment.json"
+    )
+    marker = read_json(path, {}) or {}
     run_id = marker.get("run_id") if isinstance(marker, dict) else None
     return run_id if isinstance(run_id, str) and run_id else None
 
@@ -112,7 +121,7 @@ class GoalRuntimeSupervisor:
         self.state_path = self.control_dir / "state.json"
         self.lock_path = self.control_dir / "scheduler.lock"
         self.active_experiment_path = (
-            self.project_dir / "research" / "active_experiment.json"
+            supervisor_active_experiment_path(self.project_dir)
         )
         self.adopt_session = adopt_session
         self.client_factory = client_factory or (
@@ -256,7 +265,7 @@ class GoalRuntimeSupervisor:
             active_turn_id=None,
             last_turn=completed,
         )
-        run_id = active_experiment_id(self.project_dir)
+        run_id = active_experiment_id(self.project_dir, thread_id=thread_id)
         if run_id:
             self._wait_experiment_and_activate(client, thread_id, run_id)
             return "CONTINUE"
@@ -288,7 +297,9 @@ class GoalRuntimeSupervisor:
             self._write_state(thread_id=thread_id, state="BOOTSTRAPPING")
             with self.client_factory() as client:
                 client.initialize()
-                run_id = active_experiment_id(self.project_dir)
+                run_id = active_experiment_id(
+                    self.project_dir, thread_id=thread_id
+                )
                 run = self.runner.get_run(run_id) if run_id else None
                 if run_id:
                     # Pause before resume: resuming an active idle Goal itself can

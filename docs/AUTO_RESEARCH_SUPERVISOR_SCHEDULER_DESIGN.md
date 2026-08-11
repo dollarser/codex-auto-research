@@ -167,8 +167,13 @@ Supervisor启动顺序有意区分 active run：
 | `research/codex_session.json` | 可选 `--adopt-session` 的既有 Thread 绑定 |
 | `research/active_experiment.json` | 当前非终态 run 提示 |
 | `research/supervisor/state.json` | monitor 状态、Turn ID、run、终态结果 |
+| `research/supervisor/active_experiment.json` | Supervisor 会话当前非终态 run |
 | `research/supervisor/experiment_handoff.json` | start tool 已暂停 Goal 的证据 |
 | `research/runs/<run_id>/...` | Worker 和终态事实 |
+
+旧 Listener 的 `research/active_experiment.json` 与 Supervisor marker 分离。这样独立
+Supervisor 会话可以在另一组 GPU 上运行一个实验，而不会接管已有 Desktop run；但
+每个 Supervisor 仍只有一个 active run，评估 campaign 仍需串行。
 
 ## 10. 验证门槛
 

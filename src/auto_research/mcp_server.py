@@ -20,7 +20,11 @@ from .ledger import read_json, write_json_atomic
 from .models import GoalSpec
 from .research_session import read_bound_thread_id
 from .runner import ExperimentRunner
-from .supervisor import is_supervisor_thread, pause_goal_for_experiment
+from .supervisor import (
+    is_supervisor_thread,
+    pause_goal_for_experiment,
+    supervisor_active_experiment_path,
+)
 
 
 class ExperimentService:
@@ -62,13 +66,13 @@ class ExperimentService:
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
-    def _active_run_id(self) -> str | None:
+    def _active_run_id(
+        self, marker_path: Path, *, thread_id: str | None = None
+    ) -> str | None:
         active: dict[str, Any] = {}
-        if self.active_submission_path.exists():
+        if marker_path.exists():
             try:
-                parsed = json.loads(
-                    self.active_submission_path.read_text(encoding="utf-8")
-                )
+                parsed = json.loads(marker_path.read_text(encoding="utf-8"))
                 if isinstance(parsed, dict):
                     active = parsed
                 else:
@@ -76,7 +80,7 @@ class ExperimentService:
             except (OSError, json.JSONDecodeError, TypeError, ValueError):
                 # A truncated marker is recoverable because run.json/events
                 # remain the durable source of truth.
-                self.active_submission_path.unlink(missing_ok=True)
+                marker_path.unlink(missing_ok=True)
         active_run_id = active.get("run_id")
         if isinstance(active_run_id, str):
             try:
@@ -87,21 +91,28 @@ class ExperimentService:
                 # truncated/manual marker must not take the MCP server down.
                 pass
         if active_run_id:
-            self.active_submission_path.unlink(missing_ok=True)
+            marker_path.unlink(missing_ok=True)
 
         # Recover the marker if the MCP process died immediately after submit.
         for run_file in sorted(
             self.project_dir.joinpath("research", "runs").glob("run-*/run.json")
         ):
             run = read_json(run_file, {}) or {}
-            if run.get("status") in {"SUBMITTED", "RUNNING"}:
+            if (
+                run.get("status") in {"SUBMITTED", "RUNNING"}
+                and (thread_id is None or run.get("codex_thread_id") == thread_id)
+            ):
                 return run.get("run_id")
         return None
 
     def _release_active(self, run_id: str) -> None:
-        active = read_json(self.active_submission_path, {}) or {}
-        if active.get("run_id") == run_id:
-            self.active_submission_path.unlink(missing_ok=True)
+        for marker_path in (
+            self.active_submission_path,
+            supervisor_active_experiment_path(self.project_dir),
+        ):
+            active = read_json(marker_path, {}) or {}
+            if active.get("run_id") == run_id:
+                marker_path.unlink(missing_ok=True)
 
     def _worktree(self, value: str) -> Path:
         candidate = Path(value)
@@ -192,9 +203,17 @@ class ExperimentService:
             )
         thread_id = selected_thread_id
         wake_enabled = self.config.auto_wake and not supervisor_owned
+        marker_path = (
+            supervisor_active_experiment_path(self.project_dir)
+            if supervisor_owned
+            else self.active_submission_path
+        )
         with self._submission_lock():
             if self.config.one_active_experiment:
-                active_run_id = self._active_run_id()
+                active_run_id = self._active_run_id(
+                    marker_path,
+                    thread_id=thread_id if supervisor_owned else None,
+                )
                 if active_run_id:
                     raise RuntimeError(
                         "one active experiment is allowed per project; "
@@ -219,7 +238,7 @@ class ExperimentService:
                 ),
             )
             if self.config.one_active_experiment:
-                write_json_atomic(self.active_submission_path, {"run_id": run_id})
+                write_json_atomic(marker_path, {"run_id": run_id})
         wake: dict[str, Any] = {"status": "DISABLED"}
         goal_pause: dict[str, Any] = {"status": "NOT_MANAGED"}
         if supervisor_owned:

@@ -121,6 +121,7 @@ research/
 ├── active_experiment.json
 ├── supervisor/
 │   ├── state.json
+│   ├── active_experiment.json
 │   ├── experiment_handoff.json
 │   ├── process.json
 │   └── supervisor.log
@@ -134,6 +135,9 @@ research/
 ## 安全与恢复
 
 - 项目级非阻塞锁保证一个 Supervisor monitor。
+- Supervisor-owned run 使用 `research/supervisor/active_experiment.json`；旧
+  Desktop/Listener run 继续使用 `research/active_experiment.json`，两者不会因 marker
+  冲突互相接管。Supervisor 内部仍严格一次只运行一个实验。
 - managed daemon 是 Goal runtime 的唯一进程 owner。
 - 多个 WebSocket connection 可以共享 daemon，但不能启动多个独立 App Server 进程
   恢复同一个 active Goal。
