@@ -89,6 +89,7 @@ class AppServerClient:
                     proxy=None,
                     open_timeout=30,
                     max_size=MANAGED_APP_SERVER_MAX_MESSAGE_BYTES,
+                    ping_interval=None,
                 )
             except Exception as exc:
                 raise AppServerError(

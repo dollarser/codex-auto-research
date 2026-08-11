@@ -236,6 +236,7 @@ class ExperimentService:
                     and environment_thread_id
                     and thread_id == environment_thread_id
                 ),
+                launch_worker=not supervisor_owned,
             )
             if self.config.one_active_experiment:
                 write_json_atomic(marker_path, {"run_id": run_id})

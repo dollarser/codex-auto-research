@@ -352,6 +352,7 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(result["wake_listener"]["status"], "DISABLED")
             self.assertEqual(launches, [])
             self.assertFalse(submit.call_args.kwargs["wake_enabled"])
+            self.assertFalse(submit.call_args.kwargs["launch_worker"])
             pause_goal.assert_called_once()
             self.assertEqual(
                 json.loads(

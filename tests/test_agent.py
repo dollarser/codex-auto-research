@@ -815,6 +815,7 @@ class AgentTests(unittest.TestCase):
             connect.call_args.kwargs["max_size"],
             MANAGED_APP_SERVER_MAX_MESSAGE_BYTES,
         )
+        self.assertIsNone(connect.call_args.kwargs["ping_interval"])
 
     def test_managed_app_server_can_connect_without_daemon_mutation(self):
         lifecycle = SimpleNamespace(
@@ -843,6 +844,34 @@ class AgentTests(unittest.TestCase):
             run.call_args.args[0],
             ["codex", "app-server", "daemon", "version"],
         )
+
+    def test_runner_can_defer_worker_launch_to_supervisor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            config = SimpleNamespace(
+                use_shell=True,
+                allowed_executables=[],
+                worker_heartbeat_s=5.0,
+            )
+            runner = ExperimentRunner(project / "research" / "runs", config=config)
+            with patch("auto_research.runner.subprocess.Popen") as popen:
+                run_id = runner.submit(
+                    "deferred",
+                    project,
+                    "true",
+                    60,
+                    launch_worker=False,
+                )
+            popen.assert_not_called()
+            self.assertEqual(runner.get_run(run_id)["status"], "SUBMITTED")
+
+            process = SimpleNamespace(pid=12345, wait=lambda: 0)
+            with patch(
+                "auto_research.runner.subprocess.Popen", return_value=process
+            ) as popen:
+                launched = runner.launch(run_id)
+            popen.assert_called_once()
+            self.assertEqual(launched["status"], "RUNNING")
 
 if __name__ == "__main__":
     unittest.main()

@@ -225,6 +225,7 @@ class GoalRuntimeSupervisor:
         if run.get("codex_thread_id") != thread_id:
             raise SupervisorError("active run belongs to another thread")
         client.set_goal_status(thread_id, "paused")
+        run = self.runner.launch(run_id)
         self._write_state(state="EXPERIMENT_WAITING", waiting_run_id=run_id)
         result = self.runner.wait(run_id).to_dict()
         self._clear_active_experiment(run_id)
