@@ -1,4 +1,4 @@
-"""Minimal Codex App Server client used to inspect and activate one Goal."""
+"""Small JSONL client for Codex App Server threads, Goals, and Turns."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class AppServerTimeout(AppServerError):
 
 
 class AppServerClient:
-    """Dependency-free JSONL client for the small Goal-state surface."""
+    """Dependency-free JSONL client for the auto-research control surface."""
 
     def __init__(
         self,
@@ -202,14 +202,86 @@ class AppServerClient:
             if not isinstance(cursor, str) or not cursor:
                 return threads
 
-    def read_thread(self, thread_id: str) -> dict[str, Any]:
+    def read_thread(
+        self, thread_id: str, *, include_turns: bool = False
+    ) -> dict[str, Any]:
         response = self._response(
-            self._send("thread/read", {"threadId": thread_id, "includeTurns": False})
+            self._send(
+                "thread/read",
+                {"threadId": thread_id, "includeTurns": include_turns},
+            )
         )
         thread = response.get("result", {}).get("thread", {})
         if not isinstance(thread, dict):
             raise AppServerError("thread/read did not return a thread")
         return thread
+
+    def resume_thread(self, thread_id: str) -> dict[str, Any]:
+        response = self._response(self._send("thread/resume", {"threadId": thread_id}))
+        thread = response.get("result", {}).get("thread", {})
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise AppServerError("thread/resume did not return the requested thread")
+        return thread
+
+    def start_turn(
+        self,
+        thread_id: str,
+        text: str,
+        *,
+        approval_policy: str | None = None,
+        sandbox_policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": text}],
+        }
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
+        if sandbox_policy is not None:
+            params["sandboxPolicy"] = sandbox_policy
+        response = self._response(self._send("turn/start", params))
+        turn = response.get("result", {}).get("turn", {})
+        if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
+            raise AppServerError("turn/start did not return a turn id")
+        return turn
+
+    @staticmethod
+    def _notification_turn(message: dict[str, Any]) -> dict[str, Any] | None:
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return None
+        turn = params.get("turn")
+        if isinstance(turn, dict):
+            return turn
+        return params if isinstance(params.get("id"), str) else None
+
+    def wait_turn(
+        self, thread_id: str, turn_id: str, *, timeout_s: float | None = None
+    ) -> dict[str, Any]:
+        """Consume App Server events until the exact Turn reaches completion."""
+        timeout_s = timeout_s or 24 * 3600
+        deadline = time.monotonic() + timeout_s
+        deferred: list[dict[str, Any]] = []
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AppServerTimeout(f"Turn {turn_id} timed out")
+                message = self._message(remaining, f"turn {turn_id}")
+                if self._handle_server_request(message):
+                    continue
+                method = message.get("method")
+                turn = self._notification_turn(message)
+                if method == "turn/completed" and turn is not None:
+                    event_thread_id = message.get("params", {}).get("threadId")
+                    if turn.get("id") == turn_id and event_thread_id in {
+                        None,
+                        thread_id,
+                    }:
+                        return turn
+                deferred.append(message)
+        finally:
+            self._pending.extend(deferred)
 
     def start_thread(self, *, service_name: str) -> dict[str, Any]:
         response = self._response(

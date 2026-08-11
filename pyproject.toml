@@ -1,7 +1,7 @@
 [project]
 name = "auto-research-agent"
-version = "0.3.0"
-description = "Detached experiment runner and event-driven wake bridge for Codex Goal"
+version = "0.4.0"
+description = "App Server supervisor and detached experiment runner for Codex research"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []

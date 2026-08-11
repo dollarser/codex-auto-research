@@ -82,6 +82,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     register_mcp.add_argument("--project", default=".")
 
+    supervisor = sub.add_parser(
+        "supervisor", help="run or inspect the single-writer App Server scheduler"
+    )
+    supervisor_sub = supervisor.add_subparsers(dest="supervisor_action", required=True)
+    supervisor_run = supervisor_sub.add_parser("run", help="run in the foreground")
+    supervisor_run.add_argument("--project", default=".")
+    supervisor_run.add_argument("--max-turns", type=int)
+    supervisor_start = supervisor_sub.add_parser(
+        "start", help="start a detached Supervisor process"
+    )
+    supervisor_start.add_argument("--project", default=".")
+    supervisor_status = supervisor_sub.add_parser(
+        "status", help="show durable Supervisor state"
+    )
+    supervisor_status.add_argument("--project", default=".")
+    supervisor_resume = supervisor_sub.add_parser(
+        "resume", help="move an operator-paused Supervisor back to TURN_READY"
+    )
+    supervisor_resume.add_argument("--project", default=".")
+
     args = parser.parse_args(argv)
     if args.action == "init":
         root = Path(args.project).resolve()
@@ -222,6 +242,24 @@ def main(argv: list[str] | None = None) -> int:
         from .mcp_config import register_mcp_config
 
         print(register_mcp_config(args.project))
+        return 0
+
+    if args.action == "supervisor":
+        from .supervisor import (
+            AppServerSupervisor,
+            read_supervisor_state,
+            spawn_supervisor,
+        )
+
+        if args.supervisor_action == "run":
+            result = AppServerSupervisor(args.project).run(max_turns=args.max_turns)
+        elif args.supervisor_action == "start":
+            result = spawn_supervisor(args.project)
+        elif args.supervisor_action == "resume":
+            result = AppServerSupervisor(args.project).resume()
+        else:
+            result = read_supervisor_state(args.project) or {"state": "NOT_STARTED"}
+        _print(result)
         return 0
 
     return 2

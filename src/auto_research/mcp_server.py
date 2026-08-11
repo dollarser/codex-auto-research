@@ -20,6 +20,7 @@ from .ledger import read_json, write_json_atomic
 from .models import GoalSpec
 from .research_session import read_bound_thread_id
 from .runner import ExperimentRunner
+from .supervisor import is_supervisor_thread, submit_handoff
 
 
 class ExperimentService:
@@ -186,6 +187,8 @@ class ExperimentService:
                 "dedicated task or remove the project binding intentionally"
             )
         thread_id = selected_thread_id
+        supervisor_owned = is_supervisor_thread(self.project_dir, thread_id)
+        wake_enabled = self.config.auto_wake and not supervisor_owned
         with self._submission_lock():
             if self.config.one_active_experiment:
                 active_run_id = self._active_run_id()
@@ -204,16 +207,18 @@ class ExperimentService:
                 goal_contract_digest=snapshot.get("digest"),
                 goal_contract_revision=snapshot.get("revision"),
                 hard_requirements_snapshot=snapshot.get("hard_requirements", []),
-                wake_enabled=self.config.auto_wake,
+                wake_enabled=wake_enabled,
                 codex_thread_id=thread_id,
                 pause_goal_on_turn_end=bool(
-                    environment_thread_id and thread_id == environment_thread_id
+                    not supervisor_owned
+                    and environment_thread_id
+                    and thread_id == environment_thread_id
                 ),
             )
             if self.config.one_active_experiment:
                 write_json_atomic(self.active_submission_path, {"run_id": run_id})
         wake: dict[str, Any] = {"status": "DISABLED"}
-        if self.config.auto_wake:
+        if wake_enabled:
             try:
                 wake = self.wake_launcher(
                     self.project_dir,
@@ -230,6 +235,9 @@ class ExperimentService:
             "status": "RUNNING",
             "worktree": str(resolved),
             "wake_listener": wake,
+            "scheduler": "app_server_supervisor"
+            if supervisor_owned
+            else "goal_wake_listener",
         }
 
     def get_experiment_result(self, run_id: str) -> dict[str, Any]:
@@ -292,6 +300,24 @@ def main() -> None:
     def cancel_experiment(run_id: str) -> dict[str, Any]:
         """Cancel a persisted run and write a terminal cancellation event."""
         return service.cancel_experiment(run_id)
+
+    @server.tool()
+    def submit_supervisor_handoff(
+        turn_attempt_id: str,
+        action: str,
+        run_id: str | None = None,
+        summary: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Submit the structured end-of-Turn decision to the App Server Supervisor."""
+        return submit_handoff(
+            service.project_dir,
+            turn_attempt_id=turn_attempt_id,
+            action=action,
+            run_id=run_id,
+            summary=summary,
+            reason=reason,
+        )
 
     server.run()
 
