@@ -88,6 +88,7 @@ def pause_goal_for_experiment(
             client_name="auto-research-experiment-pause",
             client_version="0.5.0",
             managed_daemon=True,
+            ensure_daemon=False,
         )
     )
     with factory() as client:

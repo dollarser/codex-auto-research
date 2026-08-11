@@ -816,5 +816,33 @@ class AgentTests(unittest.TestCase):
             MANAGED_APP_SERVER_MAX_MESSAGE_BYTES,
         )
 
+    def test_managed_app_server_can_connect_without_daemon_mutation(self):
+        lifecycle = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"socketPath": "/tmp/app-server.sock"}),
+        )
+        websocket = SimpleNamespace(close=lambda: None)
+        config = SimpleNamespace(app_server_response_timeout_s=60.0)
+        with (
+            patch(
+                "auto_research.app_server.subprocess.run", return_value=lifecycle
+            ) as run,
+            patch(
+                "auto_research.app_server.unix_connect", return_value=websocket
+            ),
+        ):
+            client = AppServerClient(
+                "/tmp",
+                config=config,
+                managed_daemon=True,
+                ensure_daemon=False,
+            )
+            client.close()
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["codex", "app-server", "daemon", "version"],
+        )
+
 if __name__ == "__main__":
     unittest.main()

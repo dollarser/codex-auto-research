@@ -40,6 +40,7 @@ class AppServerClient:
         client_name: str = "auto-research-goal-wake-listener",
         client_version: str = "0.3.0",
         managed_daemon: bool = False,
+        ensure_daemon: bool = True,
     ):
         self.cwd = str(Path(cwd).resolve())
         self.config = config or load_config(self.cwd)
@@ -51,8 +52,14 @@ class AppServerClient:
         self.process: subprocess.Popen[str] | None = None
         self._websocket: ClientConnection | None = None
         if managed_daemon:
+            lifecycle_command = [
+                "codex",
+                "app-server",
+                "daemon",
+                "start" if ensure_daemon else "version",
+            ]
             daemon = subprocess.run(
-                ["codex", "app-server", "daemon", "start"],
+                lifecycle_command,
                 cwd=self.cwd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -63,7 +70,7 @@ class AppServerClient:
             )
             if daemon.returncode != 0:
                 raise AppServerError(
-                    "could not start managed App Server daemon: "
+                    "could not locate managed App Server daemon: "
                     + daemon.stdout[-2000:]
                 )
             try:
