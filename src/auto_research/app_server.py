@@ -18,6 +18,8 @@ from websockets.sync.client import ClientConnection, unix_connect
 
 from .config import ResearchConfig, load_config
 
+MANAGED_APP_SERVER_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
 
 class AppServerError(RuntimeError):
     pass
@@ -79,6 +81,7 @@ class AppServerClient:
                     compression=None,
                     proxy=None,
                     open_timeout=30,
+                    max_size=MANAGED_APP_SERVER_MAX_MESSAGE_BYTES,
                 )
             except Exception as exc:
                 raise AppServerError(

@@ -13,7 +13,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from auto_research.app_server import AppServerClient
+from auto_research.app_server import (
+    MANAGED_APP_SERVER_MAX_MESSAGE_BYTES,
+    AppServerClient,
+)
 from auto_research.cli import main as cli_main
 from auto_research.config import load_config
 from auto_research.ledger import write_json_atomic
@@ -790,6 +793,27 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(
             request["params"],
             {"cwd": "/tmp/project", "serviceName": "auto-research-test"},
+        )
+
+    def test_managed_app_server_accepts_long_thread_responses(self):
+        lifecycle = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"socketPath": "/tmp/app-server.sock"}),
+        )
+        websocket = SimpleNamespace(close=lambda: None)
+        config = SimpleNamespace(app_server_response_timeout_s=60.0)
+        with (
+            patch("auto_research.app_server.subprocess.run", return_value=lifecycle),
+            patch(
+                "auto_research.app_server.unix_connect", return_value=websocket
+            ) as connect,
+        ):
+            client = AppServerClient("/tmp", config=config, managed_daemon=True)
+            client.close()
+
+        self.assertEqual(
+            connect.call_args.kwargs["max_size"],
+            MANAGED_APP_SERVER_MAX_MESSAGE_BYTES,
         )
 
 if __name__ == "__main__":
