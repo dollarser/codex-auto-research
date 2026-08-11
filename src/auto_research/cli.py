@@ -83,12 +83,11 @@ def main(argv: list[str] | None = None) -> int:
     register_mcp.add_argument("--project", default=".")
 
     supervisor = sub.add_parser(
-        "supervisor", help="run or inspect the single-writer App Server scheduler"
+        "supervisor", help="run or inspect the native Goal experiment monitor"
     )
     supervisor_sub = supervisor.add_subparsers(dest="supervisor_action", required=True)
     supervisor_run = supervisor_sub.add_parser("run", help="run in the foreground")
     supervisor_run.add_argument("--project", default=".")
-    supervisor_run.add_argument("--max-turns", type=int)
     supervisor_start = supervisor_sub.add_parser(
         "start", help="start a detached Supervisor process"
     )
@@ -252,11 +251,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         if args.supervisor_action == "run":
-            result = AppServerSupervisor(args.project).run(max_turns=args.max_turns)
+            result = AppServerSupervisor(args.project).run()
         elif args.supervisor_action == "start":
             result = spawn_supervisor(args.project)
         elif args.supervisor_action == "resume":
             result = AppServerSupervisor(args.project).resume()
+            result["supervisor"] = spawn_supervisor(args.project)
         else:
             result = read_supervisor_state(args.project) or {"state": "NOT_STARTED"}
         _print(result)

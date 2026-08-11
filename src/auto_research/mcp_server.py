@@ -20,7 +20,7 @@ from .ledger import read_json, write_json_atomic
 from .models import GoalSpec
 from .research_session import read_bound_thread_id
 from .runner import ExperimentRunner
-from .supervisor import is_supervisor_thread, submit_handoff
+from .supervisor import is_supervisor_thread, pause_goal_for_experiment
 
 
 class ExperimentService:
@@ -218,6 +218,28 @@ class ExperimentService:
             if self.config.one_active_experiment:
                 write_json_atomic(self.active_submission_path, {"run_id": run_id})
         wake: dict[str, Any] = {"status": "DISABLED"}
+        goal_pause: dict[str, Any] = {"status": "NOT_MANAGED"}
+        if supervisor_owned:
+            try:
+                pause = pause_goal_for_experiment(
+                    self.project_dir,
+                    thread_id=str(thread_id),
+                    run_id=run_id,
+                )
+                goal_pause = {"status": "PAUSED", **pause}
+            except (OSError, RuntimeError, ValueError) as exc:
+                goal_pause = {
+                    "status": "ERROR",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                write_json_atomic(
+                    self.runner.runs_dir / run_id / "goal-pause-error.json",
+                    goal_pause,
+                )
+                raise RuntimeError(
+                    f"experiment {run_id} started, but the native Goal could not "
+                    "be paused; do not submit another experiment"
+                ) from exc
         if wake_enabled:
             try:
                 wake = self.wake_launcher(
@@ -235,7 +257,8 @@ class ExperimentService:
             "status": "RUNNING",
             "worktree": str(resolved),
             "wake_listener": wake,
-            "scheduler": "app_server_supervisor"
+            "goal_pause": goal_pause,
+            "scheduler": "app_server_goal_runtime"
             if supervisor_owned
             else "goal_wake_listener",
         }
@@ -300,24 +323,6 @@ def main() -> None:
     def cancel_experiment(run_id: str) -> dict[str, Any]:
         """Cancel a persisted run and write a terminal cancellation event."""
         return service.cancel_experiment(run_id)
-
-    @server.tool()
-    def submit_supervisor_handoff(
-        turn_attempt_id: str,
-        action: str,
-        run_id: str | None = None,
-        summary: str = "",
-        reason: str = "",
-    ) -> dict[str, Any]:
-        """Submit the structured end-of-Turn decision to the App Server Supervisor."""
-        return submit_handoff(
-            service.project_dir,
-            turn_attempt_id=turn_attempt_id,
-            action=action,
-            run_id=run_id,
-            summary=summary,
-            reason=reason,
-        )
 
     server.run()
 

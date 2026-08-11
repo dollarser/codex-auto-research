@@ -1,143 +1,190 @@
-# Auto Research App Server Supervisor / Scheduler
+# Native App Server Goal Runtime + Experiment Supervisor
 
-## 1. 目标
+## 1. 目标与结论
 
-Supervisor 解决一个窄而关键的问题：长实验结束后，如何确定性地让 Codex 在同一
-研究上下文中继续，而不依赖 Desktop Goal scheduler 的隐含行为。
+本方案让 Codex 原生 Goal 持续负责研究，Supervisor 只解决长实验的等待与恢复：
 
-设计约束：
+1. App Server Goal runtime 自动创建 Goal continuation。
+2. Goal Turn 启动实验后，在本 Turn 结束前切换为 `paused`。
+3. Worker detached 运行；Supervisor 只等待本地终态事件。
+4. 终态后 Supervisor 设置 `active`，Goal runtime 自动创建下一 Turn。
+5. 完全不依赖 Desktop scheduler 或 Desktop host 私有工具。
 
-1. Codex 负责研究决策；Supervisor 只调度生命周期。
-2. 长实验期间没有模型轮询或悬挂 Turn。
-3. 一个项目默认一个专用 Thread、一个 writer、一个活动实验。
-4. 所有跳转有 durable state，可在进程退出后审计。
-5. 不从自然语言 final message 猜控制动作。
+当前 Codex 的 Goal runtime 在外部 Goal 更新为 `active` 时执行
+`continue_if_idle()`，并通过 `try_start_turn_if_idle()` 创建 continuation；恢复
+Thread 时也会恢复 active Goal 的 accounting 并触发 idle lifecycle。
 
-## 2. 控制面与执行面
+## 2. 所有权模型
 
 ```mermaid
-flowchart LR
-    SUP["Supervisor<br/>scheduler lock"] --> AS["long-lived App Server"]
-    AS <--> RT["dedicated research Thread"]
-    RT -->|"MCP"| API["Experiment service"]
-    API --> W["detached Worker"]
-    W --> EV["terminal event"]
-    EV --> SUP
-    RT --> HO["structured handoff"]
-    HO --> SUP
-    SUP --> ST["state.json"]
-    SUP -->|"turn/start"| RT
+flowchart TD
+    DAEMON["single managed App Server daemon<br/>Goal scheduler owner"]
+    GOAL["persisted native Goal"]
+    TURN["automatic Goal continuation Turn"]
+    MCP["Experiment MCP"]
+    WORKER["detached Worker"]
+    EVENT["terminal event"]
+    MONITOR["Supervisor monitor"]
+
+    DAEMON <--> GOAL
+    DAEMON --> TURN
+    TURN --> MCP
+    MCP -->|"pause before tool returns"| GOAL
+    MCP --> WORKER --> EVENT --> MONITOR
+    MONITOR -->|"inject evidence + active"| GOAL
 ```
 
-Supervisor 不调用 Desktop host bridge，也不以 `Goal=active` 作为充分唤醒条件。
-专用 Thread 可在 Desktop 查看，但 Supervisor 持锁期间不应由 Desktop 同时启动
-Turn。
+| 所有权 | Owner |
+|---|---|
+| Goal research decisions | Codex Goal Turn |
+| Goal continuation scheduling | managed App Server Goal runtime |
+| experiment execution | detached Worker |
+| experiment wait/wake | Supervisor monitor |
+| project monitor singleton | filesystem lock |
 
-## 3. 状态机
+Supervisor 不是 Thread writer，也不构造 continuation prompt，更不调用
+`turn/start`。
+
+## 3. 为什么必须使用 managed daemon
+
+Goal runtime 的 idle check、thread map、semaphore 和 active turn accounting 是
+App Server 进程内状态。多个独立 App Server 进程共享同一个 `CODEX_HOME` 时，可能
+各自认为同一个 active Goal idle，并创建重复 continuation。
+
+因此：
+
+- daemon：`codex app-server daemon start`
+- client：连接 lifecycle `socketPath` 指向的 Unix WebSocket
+- 同一 Goal 的 session bootstrap、Supervisor 和实验暂停控制全部连接该 daemon。
+- 禁止为该 Thread 启动另一个独立 `codex app-server --stdio`。
+
+多个 WebSocket connection 是同一进程内的多个订阅者，不等于多个 Goal
+scheduler。`codex app-server proxy` 透传的是 WebSocket 字节流，不接收 App Server
+JSONL；Supervisor 因此直接执行 WebSocket 握手，并关闭 compression 扩展。
+
+## 4. 正常时序
+
+```mermaid
+sequenceDiagram
+    participant D as App Server daemon
+    participant G as Native Goal runtime
+    participant C as Goal Turn
+    participant M as Experiment MCP
+    participant W as Worker
+    participant S as Supervisor
+
+    S->>D: thread/resume
+    S->>D: thread/goal/set(active)
+    D->>G: continue_if_idle
+    G->>C: automatic Goal continuation
+    C->>M: start_experiment
+    M->>W: detached submit
+    M->>D: thread/goal/set(paused)
+    M-->>C: run_id + PAUSED
+    C-->>D: turn/completed
+    Note over D,G: Goal paused, no next model Turn
+    W-->>S: durable terminal event
+    S->>D: thread/inject_items(result)
+    S->>D: thread/goal/set(active)
+    D->>G: continue_if_idle
+    G->>C: automatic Goal continuation
+```
+
+暂停必须在 MCP tool 返回前完成。若等到 `turn/completed` 后才暂停，Goal runtime
+可能已经在 Turn 结束的 idle lifecycle 中启动下一 continuation。
+
+## 5. 状态机
 
 ```mermaid
 stateDiagram-v2
-    [*] --> TURN_READY
-    TURN_READY --> TURN_STARTING
-    TURN_STARTING --> TURN_RUNNING: turn/start returns id
-    TURN_RUNNING --> HANDOFF_RECONCILING: exact turn/completed
-    HANDOFF_RECONCILING --> EXPERIMENT_WAITING: WAIT_FOR_RUN
-    HANDOFF_RECONCILING --> TURN_READY: CONTINUE_NOW
-    HANDOFF_RECONCILING --> NEEDS_USER: NEEDS_USER
-    HANDOFF_RECONCILING --> COMPLETED: COMPLETE
-    HANDOFF_RECONCILING --> FAILED_STOP: FAILED_STOP
-    HANDOFF_RECONCILING --> HANDOFF_UNCONFIRMED: missing handoff
-    EXPERIMENT_WAITING --> TURN_READY: durable terminal event
-    NEEDS_USER --> TURN_READY: operator resume
-    HANDOFF_UNCONFIRMED --> TURN_READY: operator resume
-    RECOVERY_ERROR --> TURN_READY: operator resume
+    [*] --> BOOTSTRAPPING
+    BOOTSTRAPPING --> GOAL_ACTIVATING
+    GOAL_ACTIVATING --> GOAL_RUNNING: automatic turn/started
+    GOAL_ACTIVATING --> RECOVERY_ERROR: no automatic turn/started
+    GOAL_RUNNING --> GOAL_TURN_COMPLETED: turn/completed
+    GOAL_TURN_COMPLETED --> EXPERIMENT_WAITING: active run exists
+    GOAL_TURN_COMPLETED --> GOAL_RUNNING: Goal remains active
+    GOAL_TURN_COMPLETED --> COMPLETED: Goal complete
+    GOAL_TURN_COMPLETED --> NEEDS_USER: blocked or limited
+    EXPERIMENT_WAITING --> GOAL_ACTIVATING: terminal + set active
+    NEEDS_USER --> BOOTSTRAPPING: operator resume
+    RECOVERY_ERROR --> BOOTSTRAPPING: operator resume
 ```
 
-当前 v0.4 对启动后遗留的 `TURN_STARTING`、`TURN_RUNNING`、
-`HANDOFF_RECONCILING` 采取 fail-closed：进入 `RECOVERY_ERROR`，避免在无法确认是否
-已经创建 Turn 时重复 `turn/start`。后续版本可通过 `thread/read(includeTurns=true)`
-加入 attempt reconciliation。
+`GOAL_ACTIVATING` 的成功条件不是读回 `active`，而是同一 daemon 发出新的
+`turn/started`。Supervisor随后只观察该 Turn 的 `turn/completed`。
 
-## 4. 结构化 handoff
+## 6. 实验暂停协议
 
-Turn prompt 带唯一 `turn_attempt_id`。MCP 工具
-`submit_supervisor_handoff` 原子写入：
+`start_experiment` 完成以下原子边界：
 
-```json
-{
-  "schema_version": 1,
-  "turn_attempt_id": "attempt-...",
-  "thread_id": "019f...",
-  "turn_id": "turn-...",
-  "action": "WAIT_FOR_RUN",
-  "run_id": "run-v17-...",
-  "summary": "training started and startup was validated",
-  "reason": "terminal metrics are the only remaining dependency"
-}
-```
+1. 校验当前 Thread 与项目专用 Thread 一致。
+2. 持久化 run、active marker 和 Goal contract snapshot。
+3. 启动 detached Worker。
+4. 通过 daemon WebSocket 设置当前 Goal `paused`。
+5. 写 `experiment_handoff.json`。
+6. 返回 `goal_pause.status=PAUSED`。
 
-校验规则：
+暂停失败不会伪装成功：工具写入
+`runs/<run_id>/goal-pause-error.json` 后抛出包含 `run_id` 的错误。实验已经启动，
+Codex此时不得重提实验或结束当前 Turn，应先修复暂停控制或取消该 run。
 
-- attempt 必须等于 `active_turn.json`；
-- 每个 attempt 只能提交一个语义一致的 handoff；
-- `WAIT_FOR_RUN` 必须提供存在的 run；
-- run 的 `codex_thread_id` 必须等于 Supervisor Thread；
-- 缺少 handoff 进入人工停点，不自动生成下一个 Turn；
-- 连续 `CONTINUE_NOW` 最多一次，防止无实验空转。
+## 7. 实验恢复协议
 
-## 5. 实验交接
+Supervisor观察到 terminal event 后：
 
-Supervisor-owned Turn 调用 `start_experiment` 时：
+1. 校验 run 的 `codex_thread_id`。
+2. 清除匹配的 `active_experiment.json`。
+3. 用 `thread/inject_items` 写入不可信的终态 JSON、artifact path 和日志尾部。
+4. 设置 Supervisor 状态 `GOAL_ACTIVATING`。
+5. `thread/goal/set(active)`。
+6. 等待自动 `turn/started`，不得调用 `turn/start` 补救。
 
-1. `CODEX_THREAD_ID`/显式 thread 与项目绑定一致；
-2. run 写入 `codex_thread_id`；
-3. `wake_enabled=false`，不创建 Listener；
-4. MCP 返回 `scheduler=app_server_supervisor`；
-5. Codex 验证启动稳定后提交 `WAIT_FOR_RUN`；
-6. Turn 完成，Supervisor 在本地等待 terminal event；
-7. 终态结果放进下一 Turn prompt，再显式 `turn/start`。
+如果 120 秒内没有自动 Turn，进入 `RECOVERY_ERROR`。这样可以暴露 feature、daemon
+ownership 或 runtime 状态问题，而不会偷偷降级成普通 Turn。
 
-实验失败、超时、取消和 LOST 都会创建分析 Turn；它们是研究证据，不自动等价于
-整个 Goal 失败。
+## 8. 重启恢复
 
-## 6. 持久文件
+Supervisor启动顺序有意区分 active run：
+
+- 存在 active run：先通过 Goal state API 设置 `paused`，再 `thread/resume`，避免
+  resume active Goal 时自动 continuation；随后恢复等待。
+- 不存在 active run：直接 `thread/resume`。active Goal 会由 daemon 自动续跑；
+  paused 初始 Goal由 Supervisor 显式设为 active。
+- 已有 in-progress Turn：从 resume/read 返回的 Turn 列表取得 ID并继续等待终态。
+- Goal complete：Supervisor结束。
+- blocked/usageLimited/budgetLimited：进入 `NEEDS_USER`。
+
+## 9. 持久文件
 
 | 文件 | 用途 |
 |---|---|
-| `research/codex_session.json` | 项目专用 Thread 绑定 |
-| `research/supervisor/state.json` | 当前 scheduler 状态、run、Turn、handoff |
-| `research/supervisor/active_turn.json` | 当前 attempt 与精确 Turn ID |
-| `research/supervisor/handoffs/*.json` | Agent 的不可猜测控制决定 |
-| `research/supervisor/process.json` | detached Supervisor PID 记录 |
-| `research/runs/<run_id>/...` | Worker、heartbeat、metrics、terminal event |
+| `research/codex_session.json` | 专用 Thread ID、objective 和项目绑定 |
+| `research/active_experiment.json` | 当前非终态 run 提示 |
+| `research/supervisor/state.json` | monitor 状态、Turn ID、run、终态结果 |
+| `research/supervisor/experiment_handoff.json` | start tool 已暂停 Goal 的证据 |
+| `research/runs/<run_id>/...` | Worker 和终态事实 |
 
-这些文件描述持久事实，不应单独用来声称 Desktop UI 当前 active。Supervisor 的
-执行事实来自它自己的 App Server Turn lifecycle。
+## 10. 验证门槛
 
-## 7. 故障与恢复
+单元测试必须证明：
 
-| 故障 | v0.4 行为 |
-|---|---|
-| 第二个 Supervisor 启动 | 非阻塞 lock 立即拒绝 |
-| Turn 完成但没有 handoff | `HANDOFF_UNCONFIRMED` |
-| run/thread 不匹配 | 拒绝 handoff或 `RECOVERY_ERROR` |
-| Worker/Turn 宿主退出 | Worker setsid 继续；状态保留 |
-| App Server approval/user input | 默认 decline/cancel，不隐式扩大授权 |
-| 等待实验时 Supervisor 重启 | 从 `EXPERIMENT_WAITING` 与 run_id 继续 |
-| 模糊的 in-flight Turn 重启 | fail-closed，等待人工对账 |
+- Supervisor代码路径从不调用 `turn/start`；
+- paused Goal 激活后观察到 native `turn/started`；
+- run 终态后注入结果并重新 active；
+- 第二次 Goal continuation 能继续并完成；
+- Supervisor-owned run 不启动旧 Listener；
+- pause handoff 与 run/thread 精确绑定。
 
-人工确认后运行 `auto-research supervisor resume`，再重新启动 foreground 或
-detached Supervisor。`resume` 不负责终止冲突 writer，操作者必须先解决冲突。
+真实 daemon smoke test 还需验证：
 
-## 8. 后续增强
+1. 不发送 `turn/start`，仅 `set(active)` 即出现 `turn/started`。
+2. active Turn 内 set(paused) 后，Turn结束不再 continuation。
+3. set(active) 后重新出现 Goal continuation。
+4. daemon重启后 active/paused run 恢复符合预期。
 
-- 用 `thread/read(includeTurns=true)` 对账 `turn_attempt_id`，安全恢复启动响应丢失。
-- 增加 lease heartbeat 与进程存活诊断。
-- 将 approval/user-input 持久化为精确的 `NEEDS_USER` 请求。
-- 增加显式 shutdown/interrupt 管理命令。
-- 在单实验语义稳定后，再设计多个 run 的 fan-out/fan-in handoff。
+参考：
 
-官方协议参考：
-
-- [App Server lifecycle](https://learn.chatgpt.com/docs/app-server#lifecycle-overview)
-- [App Server Turns](https://learn.chatgpt.com/docs/app-server#turns)
+- [App Server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)
+- [Goal runtime source](https://github.com/openai/codex/blob/main/codex-rs/ext/goal/src/runtime.rs)
+- [多 App Server Goal 并发问题](https://github.com/openai/codex/issues/32793)

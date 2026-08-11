@@ -87,7 +87,8 @@ class ResearchSessionManager:
             lambda: AppServerClient(
                 self.project_dir,
                 client_name="auto-research-session-bootstrap",
-                client_version="0.3.0",
+                client_version="0.5.0",
+                managed_daemon=True,
             )
         )
 

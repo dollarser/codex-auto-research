@@ -9,8 +9,12 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Self
+
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.client import ClientConnection, unix_connect
 
 from .config import ResearchConfig, load_config
 
@@ -33,6 +37,7 @@ class AppServerClient:
         *,
         client_name: str = "auto-research-goal-wake-listener",
         client_version: str = "0.3.0",
+        managed_daemon: bool = False,
     ):
         self.cwd = str(Path(cwd).resolve())
         self.config = config or load_config(self.cwd)
@@ -41,20 +46,61 @@ class AppServerClient:
         self._next_id = 1
         self._pending: deque[dict[str, Any]] = deque()
         self._stderr: deque[str] = deque(maxlen=100)
-        self.process = subprocess.Popen(
-            ["codex", "app-server", "--stdio"],
-            cwd=self.cwd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
-        self._stderr_thread.start()
+        self.process: subprocess.Popen[str] | None = None
+        self._websocket: ClientConnection | None = None
+        if managed_daemon:
+            daemon = subprocess.run(
+                ["codex", "app-server", "daemon", "start"],
+                cwd=self.cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if daemon.returncode != 0:
+                raise AppServerError(
+                    "could not start managed App Server daemon: "
+                    + daemon.stdout[-2000:]
+                )
+            try:
+                lifecycle = json.loads(daemon.stdout)
+                socket_path = lifecycle["socketPath"]
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise AppServerError(
+                    "daemon start did not return a control socket: "
+                    + daemon.stdout[-2000:]
+                ) from exc
+            try:
+                self._websocket = unix_connect(
+                    socket_path,
+                    uri="ws://localhost/",
+                    compression=None,
+                    proxy=None,
+                    open_timeout=30,
+                )
+            except Exception as exc:
+                raise AppServerError(
+                    f"could not connect to managed App Server at {socket_path}"
+                ) from exc
+        else:
+            self.process = subprocess.Popen(
+                ["codex", "app-server", "--stdio"],
+                cwd=self.cwd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr, daemon=True
+            )
+            self._stderr_thread.start()
 
     def _drain_stderr(self) -> None:
-        if self.process.stderr:
+        if self.process and self.process.stderr:
             for line in self.process.stderr:
                 self._stderr.append(line.rstrip())
 
@@ -62,7 +108,23 @@ class AppServerClient:
         return "\n".join(self._stderr)[-4000:]
 
     def _readline(self, timeout_s: float, context: str) -> str:
-        if not self.process.stdout:
+        websocket = getattr(self, "_websocket", None)
+        if websocket is not None:
+            try:
+                message = websocket.recv(timeout=timeout_s)
+            except TimeoutError as exc:
+                raise AppServerTimeout(
+                    f"App Server produced no data for {context} within "
+                    f"{timeout_s:.1f}s"
+                ) from exc
+            except ConnectionClosed as exc:
+                raise AppServerError(
+                    f"managed App Server closed during {context}"
+                ) from exc
+            if not isinstance(message, str):
+                raise AppServerError("managed App Server sent a binary frame")
+            return message
+        if not self.process or not self.process.stdout:
             raise AppServerError("App Server stdout is closed")
         stream = self.process.stdout
         try:
@@ -91,9 +153,17 @@ class AppServerClient:
         return line
 
     def _write(self, message: dict[str, Any]) -> None:
-        if not self.process.stdin:
+        payload = json.dumps(message, ensure_ascii=False)
+        websocket = getattr(self, "_websocket", None)
+        if websocket is not None:
+            try:
+                websocket.send(payload)
+            except ConnectionClosed as exc:
+                raise AppServerError("managed App Server connection is closed") from exc
+            return
+        if not self.process or not self.process.stdin:
             raise AppServerError("App Server stdin is closed")
-        self.process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+        self.process.stdin.write(payload + "\n")
         self.process.stdin.flush()
 
     def _send(self, method: str, params: dict[str, Any]) -> int:
@@ -283,6 +353,58 @@ class AppServerClient:
         finally:
             self._pending.extend(deferred)
 
+    def wait_notification(
+        self,
+        methods: str | set[str],
+        *,
+        timeout_s: float | None = None,
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Wait for a matching notification while servicing server requests."""
+        accepted = {methods} if isinstance(methods, str) else methods
+        timeout_s = timeout_s or 24 * 3600
+        deadline = time.monotonic() + timeout_s
+        deferred: list[dict[str, Any]] = []
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AppServerTimeout(
+                        f"App Server notification {sorted(accepted)} timed out"
+                    )
+                message = self._message(remaining, "notification")
+                if self._handle_server_request(message):
+                    continue
+                if message.get("method") in accepted and (
+                    predicate is None or predicate(message)
+                ):
+                    return message
+                deferred.append(message)
+        finally:
+            self._pending.extend(deferred)
+
+    def wait_turn_started(
+        self, thread_id: str, *, timeout_s: float | None = None
+    ) -> dict[str, Any]:
+        message = self.wait_notification(
+            "turn/started",
+            timeout_s=timeout_s,
+            predicate=lambda item: item.get("params", {}).get("threadId")
+            == thread_id,
+        )
+        turn = self._notification_turn(message)
+        if turn is None:
+            raise AppServerError("turn/started did not contain a Turn")
+        return turn
+
+    def inject_items(self, thread_id: str, items: list[dict[str, Any]]) -> None:
+        self._response(
+            self._send(
+                "thread/inject_items",
+                {"threadId": thread_id, "items": items},
+            )
+        )
+
     def start_thread(self, *, service_name: str) -> dict[str, Any]:
         response = self._response(
             self._send(
@@ -333,7 +455,11 @@ class AppServerClient:
         return self.set_goal(thread_id, status=status)
 
     def close(self) -> None:
-        if self.process.poll() is None:
+        websocket = getattr(self, "_websocket", None)
+        if websocket is not None:
+            websocket.close()
+            self._websocket = None
+        if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
                 self.process.wait(timeout=5)
