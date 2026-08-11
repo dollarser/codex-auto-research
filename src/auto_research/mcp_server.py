@@ -231,38 +231,23 @@ class ExperimentService:
                 hard_requirements_snapshot=snapshot.get("hard_requirements", []),
                 wake_enabled=wake_enabled,
                 codex_thread_id=thread_id,
-                pause_goal_on_turn_end=bool(
-                    not supervisor_owned
-                    and environment_thread_id
-                    and thread_id == environment_thread_id
-                ),
-                launch_worker=not supervisor_owned,
+                pause_goal_on_turn_end=False,
+                launch_worker=True,
             )
             if self.config.one_active_experiment:
-                write_json_atomic(marker_path, {"run_id": run_id})
-        wake: dict[str, Any] = {"status": "DISABLED"}
-        goal_pause: dict[str, Any] = {"status": "NOT_MANAGED"}
-        if supervisor_owned:
-            try:
-                pause = pause_goal_for_experiment(
-                    self.project_dir,
-                    thread_id=str(thread_id),
-                    run_id=run_id,
-                )
-                goal_pause = {"status": "PAUSED", **pause}
-            except (OSError, RuntimeError, ValueError) as exc:
-                goal_pause = {
-                    "status": "ERROR",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
                 write_json_atomic(
-                    self.runner.runs_dir / run_id / "goal-pause-error.json",
-                    goal_pause,
+                    marker_path,
+                    {
+                        "run_id": run_id,
+                        "thread_id": thread_id,
+                        "wait_requested": False,
+                    },
                 )
-                raise RuntimeError(
-                    f"experiment {run_id} started, but the native Goal could not "
-                    "be paused; do not submit another experiment"
-                ) from exc
+        wake: dict[str, Any] = {"status": "DISABLED"}
+        goal_pause: dict[str, Any] = {
+            "status": "NOT_REQUESTED",
+            "continuation_allowed": True,
+        }
         if wake_enabled:
             try:
                 wake = self.wake_launcher(
@@ -284,6 +269,44 @@ class ExperimentService:
             "scheduler": "app_server_goal_runtime"
             if supervisor_owned
             else "goal_wake_listener",
+        }
+
+    def wait_for_experiment(
+        self, run_id: str, thread_id: str | None = None
+    ) -> dict[str, Any]:
+        """Pause a managed Goal only after the Agent has no useful work left."""
+        environment_thread_id = os.environ.get("CODEX_THREAD_ID") or None
+        if thread_id and environment_thread_id and thread_id != environment_thread_id:
+            raise ValueError("thread_id does not match the current CODEX_THREAD_ID")
+        selected_thread_id = thread_id or environment_thread_id
+        if not selected_thread_id or not is_supervisor_thread(
+            self.project_dir, selected_thread_id
+        ):
+            raise ValueError(
+                "wait_for_experiment requires the managed Supervisor Goal task"
+            )
+        result = self.runner.get_result(run_id)
+        if result is not None:
+            return {
+                **result.to_dict(),
+                "wait_handoff": "NOT_NEEDED",
+            }
+        with self._submission_lock():
+            active = read_json(
+                supervisor_active_experiment_path(self.project_dir), {}
+            ) or {}
+            if active.get("run_id") != run_id:
+                raise ValueError("run_id is not the Supervisor's active experiment")
+            handoff = pause_goal_for_experiment(
+                self.project_dir,
+                thread_id=selected_thread_id,
+                run_id=run_id,
+            )
+        return {
+            "run_id": run_id,
+            "status": "WAITING",
+            "wait_handoff": "PAUSED",
+            "goal_pause": handoff,
         }
 
     def get_experiment_result(self, run_id: str) -> dict[str, Any]:
@@ -341,6 +364,13 @@ def main() -> None:
     def get_experiment_result(run_id: str) -> dict[str, Any]:
         """Read a terminal result, or return RUNNING if no terminal event exists."""
         return service.get_experiment_result(run_id)
+
+    @server.tool()
+    def wait_for_experiment(
+        run_id: str, thread_id: str | None = None
+    ) -> dict[str, Any]:
+        """Pause only when no useful work remains before this run finishes."""
+        return service.wait_for_experiment(run_id, thread_id=thread_id)
 
     @server.tool()
     def cancel_experiment(run_id: str) -> dict[str, Any]:

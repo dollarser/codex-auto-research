@@ -57,9 +57,10 @@ def supervisor_active_experiment_path(project_dir: str | Path) -> Path:
     return supervisor_dir(project_dir) / "active_experiment.json"
 
 
-def active_experiment_id(
+def active_experiment_marker(
     project_dir: str | Path, *, thread_id: str | None = None
-) -> str | None:
+) -> dict[str, Any] | None:
+    """Read the active-run marker selected for one exact controller."""
     path = (
         supervisor_active_experiment_path(project_dir)
         if thread_id and is_supervisor_thread(project_dir, thread_id)
@@ -67,7 +68,14 @@ def active_experiment_id(
     )
     marker = read_json(path, {}) or {}
     run_id = marker.get("run_id") if isinstance(marker, dict) else None
-    return run_id if isinstance(run_id, str) and run_id else None
+    return marker if isinstance(run_id, str) and run_id else None
+
+
+def active_experiment_id(
+    project_dir: str | Path, *, thread_id: str | None = None
+) -> str | None:
+    marker = active_experiment_marker(project_dir, thread_id=thread_id)
+    return str(marker["run_id"]) if marker else None
 
 
 def pause_goal_for_experiment(
@@ -77,11 +85,29 @@ def pause_goal_for_experiment(
     run_id: str,
     client_factory: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
-    """Pause a loaded native Goal before its experiment-launching Turn ends."""
+    """Explicitly hand a run to Supervisor when only waiting remains.
+
+    Starting an experiment does not call this function. The Goal Turn calls it
+    only after it has exhausted useful work that can proceed while the run is
+    active. Persisting the wait request before pausing makes restart recovery
+    deterministic across the Turn-finalization boundary.
+    """
     project = Path(project_dir).resolve()
     state = read_supervisor_state(project)
     if not state or state.get("thread_id") != thread_id:
         raise SupervisorError("run did not originate from the managed Goal thread")
+    marker_path = supervisor_active_experiment_path(project)
+    marker = read_json(marker_path, {}) or {}
+    if marker.get("run_id") != run_id:
+        raise SupervisorError("run is not the managed Goal thread's active experiment")
+    marker.update(
+        {
+            "wait_requested": True,
+            "wait_requested_at": time.time(),
+            "thread_id": thread_id,
+        }
+    )
+    write_json_atomic(marker_path, marker)
     factory = client_factory or (
         lambda: AppServerClient(
             project,
@@ -99,6 +125,7 @@ def pause_goal_for_experiment(
         "thread_id": thread_id,
         "run_id": run_id,
         "goal_status": goal.get("status"),
+        "wait_requested": True,
         "paused_at": time.time(),
     }
     write_json_atomic(supervisor_dir(project) / "experiment_handoff.json", handoff)
@@ -183,6 +210,44 @@ class GoalRuntimeSupervisor:
         if marker.get("run_id") == run_id:
             self.active_experiment_path.unlink(missing_ok=True)
 
+    def _finish_experiment(
+        self, client: Any, thread_id: str, run_id: str, result: dict[str, Any]
+    ) -> None:
+        self._clear_active_experiment(run_id)
+        client.inject_items(thread_id, self._terminal_context(result))
+        self._write_state(
+            state="EXPERIMENT_TERMINAL",
+            waiting_run_id=None,
+            last_terminal_result=result,
+        )
+
+    def _launch_or_observe_experiment(
+        self, client: Any, thread_id: str, marker: dict[str, Any]
+    ) -> str:
+        """Advance one owned run without suppressing useful continuations."""
+        run_id = str(marker["run_id"])
+        run = self.runner.get_run(run_id)
+        if run.get("codex_thread_id") != thread_id:
+            return "FOREIGN"
+        if run.get("status") == "SUBMITTED":
+            run = self.runner.launch(run_id)
+        result = self.runner.get_result(run_id)
+        if result is not None:
+            self._finish_experiment(client, thread_id, run_id, result.to_dict())
+            goal = client.get_goal(thread_id)
+            if goal and goal.get("status") == "paused":
+                client.set_goal_status(thread_id, "active")
+            return "TERMINAL"
+        if marker.get("wait_requested") is True:
+            self._wait_experiment_and_activate(client, thread_id, run_id)
+            return "WAITED"
+        self._write_state(
+            state="EXPERIMENT_RUNNING_WITH_CONTINUATIONS",
+            waiting_run_id=None,
+            active_run_id=run_id,
+        )
+        return "RUNNING"
+
     @staticmethod
     def _terminal_context(result: dict[str, Any]) -> list[dict[str, Any]]:
         payload = json.dumps(result, ensure_ascii=False, indent=2)
@@ -228,8 +293,7 @@ class GoalRuntimeSupervisor:
         run = self.runner.launch(run_id)
         self._write_state(state="EXPERIMENT_WAITING", waiting_run_id=run_id)
         result = self.runner.wait(run_id).to_dict()
-        self._clear_active_experiment(run_id)
-        client.inject_items(thread_id, self._terminal_context(result))
+        self._finish_experiment(client, thread_id, run_id, result)
         self._write_state(
             state="GOAL_ACTIVATING",
             waiting_run_id=None,
@@ -267,10 +331,19 @@ class GoalRuntimeSupervisor:
             active_turn_id=None,
             last_turn=completed,
         )
-        run_id = active_experiment_id(self.project_dir, thread_id=thread_id)
-        if run_id:
-            self._wait_experiment_and_activate(client, thread_id, run_id)
-            return "CONTINUE"
+        marker = active_experiment_marker(self.project_dir, thread_id=thread_id)
+        if marker:
+            disposition = self._launch_or_observe_experiment(
+                client, thread_id, marker
+            )
+            if disposition == "FOREIGN":
+                run_id = str(marker["run_id"])
+                run = self.runner.get_run(run_id)
+                self._wait_foreign_experiment(client, thread_id, run_id, run)
+            # Even while a run remains active, the just-finished Goal Turn may
+            # have completed, blocked, or hit a limit. Fall through to the
+            # authoritative Goal check instead of waiting for a continuation
+            # that the runtime will never create.
         goal = client.get_goal(thread_id)
         stop = self._goal_stop_state(goal)
         if stop:
@@ -299,11 +372,12 @@ class GoalRuntimeSupervisor:
             self._write_state(thread_id=thread_id, state="BOOTSTRAPPING")
             with self.client_factory() as client:
                 client.initialize()
-                run_id = active_experiment_id(
+                marker = active_experiment_marker(
                     self.project_dir, thread_id=thread_id
                 )
+                run_id = str(marker["run_id"]) if marker else None
                 run = self.runner.get_run(run_id) if run_id else None
-                if run_id:
+                if run_id and marker and marker.get("wait_requested") is True:
                     # Pause before resume: resuming an active idle Goal itself can
                     # launch a continuation inside the managed daemon.
                     client.set_goal_status(thread_id, "paused")
@@ -311,7 +385,10 @@ class GoalRuntimeSupervisor:
 
                 if run_id:
                     if run and run.get("codex_thread_id") == thread_id:
-                        self._wait_experiment_and_activate(client, thread_id, run_id)
+                        assert marker is not None
+                        self._launch_or_observe_experiment(
+                            client, thread_id, marker
+                        )
                     else:
                         assert run is not None
                         self._wait_foreign_experiment(

@@ -1,7 +1,8 @@
 # Auto Research Agent
 
 `main` 是 v0.5：由单一 managed App Server daemon 的原生 Goal runtime 执行长期
-研究；Supervisor 只监控 detached 实验并控制 Goal 的 `paused → active` 交接。
+研究；Supervisor 只监控 detached 实验，并在 Agent 明确进入纯等待阶段后控制
+Goal 的 `paused → active` 交接。
 它不依赖 Desktop，也不调用 `turn/start` 创建普通 continuation。
 
 ## 架构
@@ -11,8 +12,9 @@ flowchart TD
     D["managed App Server daemon"] --> G["native Codex Goal runtime"]
     G -->|"automatic Goal continuation"| T["Goal Turn"]
     T -->|"start_experiment"| M["Experiment MCP"]
-    M -->|"thread/goal/set paused"| G
     M --> W["detached Worker"]
+    T -->|"wait_for_experiment<br/>only when no useful work remains"| M
+    M -->|"thread/goal/set paused"| G
     W --> E["durable terminal event"]
     E --> S["Supervisor monitor"]
     S -->|"inject terminal evidence"| D
@@ -23,8 +25,10 @@ flowchart TD
 
 - 只有 App Server Goal runtime 创建研究 continuation。
 - Supervisor 从不调用 `turn/start`。
-- 实验启动工具在当前 Goal Turn 结束前同步设置 Goal `paused`。
-- 实验期间仅 Worker 和本地 Supervisor 运行，不消耗模型 token。
+- `start_experiment` 不暂停 Goal；实验运行期间允许原生 continuation 继续分析、
+  检查稳定性和设计后续方案。
+- 只有 Agent 判断除等待终态外已无有效工作时，才调用 `wait_for_experiment` 同步
+  设置 Goal `paused`。
 - 实验终态先持久化，再注入证据并设置 Goal `active`。
 - 必须收到自动 `turn/started`，才算 Goal 真正恢复。
 - 所有客户端连接同一个 managed daemon；不得为同一 Goal 启动第二个独立
@@ -103,14 +107,14 @@ Goal Turn 调用 `start_experiment` 后，返回：
   "run_id": "run-idea-001-ab12cd34",
   "status": "RUNNING",
   "scheduler": "app_server_goal_runtime",
-  "goal_pause": {"status": "PAUSED"},
+  "goal_pause": {"status": "NOT_REQUESTED", "continuation_allowed": true},
   "wake_listener": {"status": "DISABLED"}
 }
 ```
 
-`goal_pause.status` 必须为 `PAUSED`，Goal Turn 才应结束。终态后 Supervisor 将
-结果作为不可信外部事件注入 Thread 历史，再设置 Goal `active`。Goal runtime 的
-下一 continuation 可以直接读取 run 路径、状态、日志尾部和 metrics。
+此时 Goal 保持 active。Agent 可以继续有价值的研究；只有工作清单只剩等待时才调用
+`wait_for_experiment(run_id)`。该工具返回 `wait_handoff=PAUSED` 后结束 Turn。终态后
+Supervisor 将结果作为不可信外部事件注入 Thread 历史，再设置 Goal `active`。
 
 ## 持久状态
 

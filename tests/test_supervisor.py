@@ -124,6 +124,11 @@ class FakeGoalClient:
         self.calls.append(("wait-completed", thread_id, turn_id))
         if self.on_turn_completed:
             self.on_turn_completed(self, self.turn_count)
+        if self.goal.get("status") == "active":
+            self.turn_count += 1
+            self.started.append(
+                {"id": f"goal-turn-{self.turn_count}", "status": "inProgress"}
+            )
         return {"id": turn_id, "status": "completed"}
 
     def inject_items(self, thread_id, items):
@@ -283,6 +288,14 @@ class SupervisorTests(unittest.TestCase):
                 },
             )
             client = FakeGoalClient()
+            write_json_atomic(
+                supervisor_active_experiment_path(project),
+                {
+                    "run_id": "run-one",
+                    "thread_id": "thread-goal",
+                    "wait_requested": False,
+                },
+            )
 
             result = pause_goal_for_experiment(
                 project,
@@ -297,7 +310,103 @@ class SupervisorTests(unittest.TestCase):
                 (supervisor_dir(project) / "experiment_handoff.json").exists()
             )
 
-    def test_supervisor_owned_experiment_pauses_goal_without_listener(self):
+    def test_running_experiment_allows_multiple_goal_continuations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            write_goal(project)
+            runner = ExperimentRunner(project / "research" / "runs")
+            run_id = runner.submit(
+                "idea",
+                project,
+                "python train.py",
+                60,
+                codex_thread_id="thread-goal",
+                launch_worker=False,
+            )
+            run_dir = runner.runs_dir / run_id
+            run = runner.get_run(run_id)
+            write_json_atomic(run_dir / "run.json", {**run, "status": "RUNNING"})
+            write_json_atomic(
+                supervisor_active_experiment_path(project),
+                {
+                    "run_id": run_id,
+                    "thread_id": "thread-goal",
+                    "wait_requested": False,
+                },
+            )
+
+            def advance(client, turn_count):
+                if turn_count == 2:
+                    current = runner.get_run(run_id)
+                    finalize_run(
+                        run_dir,
+                        "completed.json",
+                        {
+                            "event": "RUN_COMPLETED",
+                            "run_id": run_id,
+                            "idea_id": "idea",
+                            "status": "COMPLETED",
+                            "return_code": 0,
+                            "finished_at": time.time(),
+                        },
+                        current,
+                    )
+                elif turn_count == 3:
+                    client.goal["status"] = "complete"
+
+            client = FakeGoalClient(on_turn_completed=advance)
+            result = GoalRuntimeSupervisor(
+                project,
+                client_factory=lambda: client,
+                session_factory=lambda: FakeSession("thread-goal"),
+                runner=runner,
+            ).run()
+
+            self.assertEqual(result["state"], "COMPLETED")
+            self.assertEqual(client.turn_count, 3)
+            self.assertTrue(client.injected)
+
+    def test_running_experiment_still_honors_goal_stop_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            write_goal(project)
+            runner = ExperimentRunner(project / "research" / "runs")
+            run_id = runner.submit(
+                "idea",
+                project,
+                "python train.py",
+                60,
+                codex_thread_id="thread-goal",
+                launch_worker=False,
+            )
+            run_dir = runner.runs_dir / run_id
+            run = runner.get_run(run_id)
+            write_json_atomic(run_dir / "run.json", {**run, "status": "RUNNING"})
+            write_json_atomic(
+                supervisor_active_experiment_path(project),
+                {
+                    "run_id": run_id,
+                    "thread_id": "thread-goal",
+                    "wait_requested": False,
+                },
+            )
+
+            def block_goal(client, turn_count):
+                client.goal["status"] = "blocked"
+
+            client = FakeGoalClient(on_turn_completed=block_goal)
+            result = GoalRuntimeSupervisor(
+                project,
+                client_factory=lambda: client,
+                session_factory=lambda: FakeSession("thread-goal"),
+                runner=runner,
+            ).run()
+
+            self.assertEqual(result["state"], "NEEDS_USER")
+            self.assertEqual(result["goal"]["status"], "blocked")
+            self.assertEqual(client.turn_count, 1)
+
+    def test_supervisor_owned_experiment_starts_without_pausing_goal(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
@@ -328,40 +437,30 @@ class SupervisorTests(unittest.TestCase):
                 project / "research" / "active_experiment.json",
                 {"run_id": "foreign-desktop-run"},
             )
-            pause = {
-                "thread_id": "thread-goal",
-                "run_id": "run-test",
-                "goal_status": "paused",
-            }
             with (
                 patch.dict("os.environ", {"CODEX_THREAD_ID": "thread-goal"}),
                 patch.object(
                     service.runner, "submit", return_value="run-test"
                 ) as submit,
-                patch(
-                    "auto_research.mcp_server.pause_goal_for_experiment",
-                    return_value=pause,
-                ) as pause_goal,
             ):
                 result = service.start_experiment(
                     "idea", ".", "python train.py", thread_id="thread-goal"
                 )
 
             self.assertEqual(result["scheduler"], "app_server_goal_runtime")
-            self.assertEqual(result["goal_pause"]["status"], "PAUSED")
+            self.assertEqual(result["goal_pause"]["status"], "NOT_REQUESTED")
+            self.assertTrue(result["goal_pause"]["continuation_allowed"])
             self.assertEqual(result["wake_listener"]["status"], "DISABLED")
             self.assertEqual(launches, [])
             self.assertFalse(submit.call_args.kwargs["wake_enabled"])
-            self.assertFalse(submit.call_args.kwargs["launch_worker"])
-            pause_goal.assert_called_once()
-            self.assertEqual(
-                json.loads(
-                    supervisor_active_experiment_path(project).read_text()
-                )["run_id"],
-                "run-test",
+            self.assertTrue(submit.call_args.kwargs["launch_worker"])
+            marker = json.loads(
+                supervisor_active_experiment_path(project).read_text()
             )
+            self.assertEqual(marker["run_id"], "run-test")
+            self.assertFalse(marker["wait_requested"])
 
-    def test_supervisor_owned_experiment_fails_closed_when_pause_fails(self):
+    def test_explicit_wait_handoff_pauses_supervisor_goal(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
@@ -375,24 +474,41 @@ class SupervisorTests(unittest.TestCase):
                 },
             )
             service = ExperimentService(project)
+            runner = ExperimentRunner(project / "research" / "runs")
+            run_id = runner.submit(
+                "idea",
+                project,
+                "python train.py",
+                30,
+                codex_thread_id="thread-goal",
+                launch_worker=False,
+            )
+            write_json_atomic(
+                supervisor_active_experiment_path(project),
+                {
+                    "run_id": run_id,
+                    "thread_id": "thread-goal",
+                    "wait_requested": False,
+                },
+            )
+            client = FakeGoalClient()
             with (
                 patch.dict("os.environ", {"CODEX_THREAD_ID": "thread-goal"}),
-                patch.object(service.runner, "submit", return_value="run-test"),
                 patch(
                     "auto_research.mcp_server.pause_goal_for_experiment",
-                    side_effect=RuntimeError("daemon unavailable"),
-                ),
-                self.assertRaisesRegex(
-                    RuntimeError, "started, but the native Goal could not be paused"
+                    side_effect=lambda *args, **kwargs: pause_goal_for_experiment(
+                        *args, **kwargs, client_factory=lambda: client
+                    ),
                 ),
             ):
-                service.start_experiment(
-                    "idea", ".", "python train.py", thread_id="thread-goal"
-                )
+                result = service.wait_for_experiment(run_id)
 
-            self.assertTrue(
-                (service.runner.runs_dir / "run-test" / "goal-pause-error.json").exists()
+            self.assertEqual(result["wait_handoff"], "PAUSED")
+            self.assertIn(("goal", "thread-goal", "paused"), client.calls)
+            marker = json.loads(
+                supervisor_active_experiment_path(project).read_text()
             )
+            self.assertTrue(marker["wait_requested"])
 
 
 if __name__ == "__main__":

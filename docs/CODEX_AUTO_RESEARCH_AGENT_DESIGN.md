@@ -184,7 +184,8 @@ stateDiagram-v2
     [*] --> BINDING
     BINDING --> BINDING_RETRY: thread 不明确或 App Server 不可用
     BINDING_RETRY --> BINDING: 指数退避重试
-    BINDING --> PAUSE_HANDOFF: run_id 与 thread_id 已持久绑定
+    BINDING --> WAITING: 新 run 默认允许 continuation
+    BINDING --> PAUSE_HANDOFF: 兼容旧 run 的暂停请求
     PAUSE_HANDOFF --> PAUSE_RETRY: App Server 暂时失败
     PAUSE_RETRY --> PAUSE_HANDOFF: 指数退避重试
     PAUSE_HANDOFF --> WAITING: 提交 turn 已结束且 Goal paused
@@ -198,7 +199,11 @@ stateDiagram-v2
     SKIPPED --> [*]
 ```
 
-`PAUSE_HANDOFF` 期间 Listener 只读取持久 Goal 状态，等待提交 turn 的 token 使用量或状态发生变化，再次写 paused；这不是模型轮询。`WAITING` 期间只有 Worker 和本地 Listener 运行，Codex Goal、推理模型和 MCP 状态查询均不运行。
+新 run 默认不由 Listener 暂停 Goal，也不打断实验期间的 continuation。Codex 完成
+所有仍有价值的工作后，由当前 Desktop Goal Turn 原生进入 `blocked`；Listener 将其
+视为实验等待态，并在终态后恢复为 `active`。`PAUSE_HANDOFF` 仅保留给已经落盘的旧
+run 兼容恢复。独立 App Server 不读取 Desktop session JSONL，也不尝试跨宿主中断
+Turn。
 
 ## 7. thread 绑定
 
@@ -219,12 +224,12 @@ stateDiagram-v2
 
 官方 App Server 协议把 `thread/resume` 定义为重新打开已有 thread，把 `turn/start` 定义为启动生成；而桌面端本身已经是该 thread 的执行宿主。真实验证发现，Listener 再启动一个独立 App Server 并调用 `thread/resume` 会与桌面端争抢 writer，出现 `already has an active writer`。
 
-因此当前 Listener 只使用不接管 turn 的接口：
+因此当前 Listener 只使用不创建新 turn、不接管 writer 的接口：
 
-1. `thread/goal/get` 核对 Goal 仍可恢复并记录 turn 前的 usage。
-2. `thread/goal/set(status=paused)` 请求暂停；提交 turn 结束后再次确认 paused。
-3. 实验终态后再次读取 Goal；已经 active 或已终止时不重复激活。
-4. `thread/goal/set(status=active)` 激活持久 Goal。
+1. `thread/goal/get` 核对 Goal 与精确 thread 绑定。
+2. 等待期间不改变 active Goal，也不观察或中断 Turn。
+3. 当前宿主在只剩等待时原生写入 `blocked`。
+4. 实验终态后再次读取 Goal；blocked 时设置为 active，已经 active 或已终止时不重复。
 5. 写入 `ACTIVATED` 后退出。
 
 模型、reasoning effort、sandbox、approval 和 continuation turn 都继承原 Goal task，由原生 Goal scheduler 管理；Listener 不再有模型配置和长 turn watchdog。
@@ -245,7 +250,8 @@ stateDiagram-v2
 激活前读取持久 Goal 状态：
 
 - Goal 已 active：认为用户或原生调度器已接管，标记 `SKIPPED`。
-- Goal complete/blocked/limited：不自动激活，标记 `SKIPPED`。
+- Goal blocked：视为显式实验等待，终态后激活。
+- Goal complete/limited：不自动激活，标记 `SKIPPED`。
 - Listener 在激活响应前断线：重启后重新核对 Goal/thread；已 active 的任务不会创建第二个 turn。
 - `recover-wakes` 只恢复带有 `runtime_version=3` 和 `wake_enabled=true` 的 run，不接管 v0.1/v0.2 历史实验。
 
@@ -260,6 +266,8 @@ stateDiagram-v2
 | thread 候选不明确 | 不猜测；持续 `BINDING_RETRY` 或显式 `--thread-id` |
 | 重复终态文件事件 | 单实例锁和持久 `ACTIVATED` 状态阻止重复激活 |
 | Goal 已被人工恢复 | thread active 时 Listener 跳过重复唤醒 |
+| 实验期间产生 continuation | 正常行为；Listener 不暂停、不观察也不中断 |
+| 只剩实验等待 | 当前宿主进入 blocked；Listener 在终态后恢复 active |
 
 ## 11. 与历史架构方案对比
 
@@ -271,7 +279,7 @@ stateDiagram-v2
 | Agents SDK Director + Codex MCP Server | Agents SDK Director | 外层 Agent | 外层管理 | 外层管理 | 外层 handoff | 高但分散 | 最高 | 适合多 specialist 和 trace，本项目不需要第二个主 Agent |
 | v0.1 完整 GoalHarness | Harness 与 Codex 分担 | Harness | Harness | Harness | Harness cycle | 较低 | 高 | 稳定性逻辑集中，但固定流程侵入研究决策 |
 | v0.2 自主 Codex + 完整 Harness | Codex | Harness | Harness 强制 | Harness | Harness cycle | 高 | 高 | 研究自主性改善，但生命周期和状态机仍过重 |
-| v0.3 one-shot Listener | Codex Goal | detached Listener | Listener 在提交 turn 后确认 | Listener 只激活一次 | 原生 Goal scheduler | 最高 | 低 | 当前方案，保留闭环所需的最小外部能力 |
+| v0.3 one-shot Listener | Codex Goal | detached Listener | Agent 只剩等待时原生 blocked | Listener 只激活一次 | 原生 Goal scheduler | 最高 | 低 | Desktop 兼容方案，保留闭环所需的最小外部能力 |
 
 ### 11.2 长实验等待方式对比
 
@@ -281,7 +289,7 @@ stateDiagram-v2
 | Codex 循环查询 `get_result` | 持续产生 turn | 有 | 有 | 大量无意义 token，长时间研究成本高 | 否 |
 | `start_experiment` 后结束 turn，人工后续查询 | 结束 | 无 | 无 | 无人触发后续 turn，闭环中断 | 否 |
 | 完整 GoalHarness 等本地事件 | 结束 | 无 | 有 | 能闭环，但 Harness 状态机、cycle 和恢复逻辑复杂 | v0.1/v0.2 |
-| detached one-shot Listener 等终态事件 | 结束且 Goal paused | 无 | 有 | 需要可靠 thread 绑定和幂等唤醒 | v0.3 当前方案 |
+| continuation 后显式 blocked + detached Listener | 有效工作期间继续；纯等待时结束 | 无意义轮询为零 | 有 | 需要 Agent 正确声明纯等待点 | v0.3 Desktop 方案 |
 
 ### 11.3 为什么最终选择 v0.3
 

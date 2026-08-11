@@ -241,7 +241,6 @@ class GoalWakeListener:
             goal_status = goal.get("status")
             if goal_status in {
                 "complete",
-                "blocked",
                 "usageLimited",
                 "budgetLimited",
             }:
@@ -304,7 +303,6 @@ class GoalWakeListener:
                 raise GoalBindingError(f"thread {thread_id} no longer has a Goal")
             if goal.get("status") in {
                 "complete",
-                "blocked",
                 "usageLimited",
                 "budgetLimited",
             }:
@@ -312,6 +310,13 @@ class GoalWakeListener:
                     state="SKIPPED",
                     reason=f"Goal is {goal.get('status')}; listener will not manage it",
                     finished_at=_now(),
+                )
+            if goal.get("status") == "blocked":
+                return self._save(
+                    state="WAITING",
+                    pause_mode="blocked_wait",
+                    pause_confirmed_status="blocked",
+                    last_error=None,
                 )
 
             state = self._state()
@@ -391,9 +396,15 @@ class GoalWakeListener:
                         f"thread {thread_id} lost its Goal during pause handoff"
                     )
                 status = current.get("status")
+                if status == "blocked":
+                    return self._save(
+                        state="WAITING",
+                        pause_mode="blocked_wait",
+                        pause_confirmed_status="blocked",
+                        last_error=None,
+                    )
                 if status in {
                     "complete",
-                    "blocked",
                     "usageLimited",
                     "budgetLimited",
                 }:

@@ -123,7 +123,7 @@ class FakeAppServer:
             thread_id, {"threadId": thread_id, "status": self.goal_status}
         )
 
-    def read_thread(self, thread_id):
+    def read_thread(self, thread_id, *, include_turns=False):
         return {"id": thread_id, "status": {"type": self.thread_status}}
 
     def set_goal_status(self, thread_id, status):
@@ -407,7 +407,7 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(run["codex_thread_id"], "thread-current")
             self.assertFalse(run["pause_goal_on_turn_end"])
 
-    def test_experiment_started_from_codex_records_pause_handoff(self):
+    def test_experiment_started_from_codex_allows_continuations(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
@@ -435,7 +435,7 @@ class AgentTests(unittest.TestCase):
                 else:
                     os.environ["CODEX_THREAD_ID"] = previous
             run = service.runner.get_run(result["run_id"])
-            self.assertTrue(run["pause_goal_on_turn_end"])
+            self.assertFalse(run["pause_goal_on_turn_end"])
             self.assertEqual(run["codex_thread_id"], "thread-current")
 
     def test_experiment_uses_persisted_dedicated_thread_outside_codex(self):
@@ -609,6 +609,43 @@ class AgentTests(unittest.TestCase):
             ).run()
             self.assertEqual(state["state"], "SKIPPED")
             self.assertFalse(any(call[0] == "goal" for call in clients[-1].calls))
+
+    def test_wake_listener_reactivates_blocked_goal_after_terminal_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            run_dir = write_terminal_run(project)
+            client = FakeAppServer(goal_status="blocked")
+            listener = GoalWakeListener(
+                project,
+                run_dir.name,
+                thread_id="thread-current",
+                client_factory=lambda: client,
+            )
+
+            state = listener.run()
+
+            self.assertEqual(state["state"], "ACTIVATED")
+            self.assertIn(("goal", "thread-current", "active"), client.calls)
+
+    def test_listener_treats_blocked_as_managed_experiment_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            run_dir = write_terminal_run(project)
+            run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            run["pause_goal_on_turn_end"] = True
+            write_json_atomic(run_dir / "run.json", run)
+            client = FakeAppServer(goal_status="blocked")
+            listener = GoalWakeListener(
+                project,
+                run_dir.name,
+                thread_id="thread-current",
+                client_factory=lambda: client,
+            )
+
+            state = listener._pause_goal_after_current_turn("thread-current")
+
+            self.assertEqual(state["state"], "WAITING")
+            self.assertEqual(state["pause_mode"], "blocked_wait")
 
     def test_listener_recovers_a_persisted_pause_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
