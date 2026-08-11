@@ -77,12 +77,20 @@ class ResearchSessionManager:
         self,
         project_dir: str | Path,
         *,
+        state_file_name: str = SESSION_FILE_NAME,
         client_factory: Callable[[], Any] | None = None,
     ):
+        if Path(state_file_name).name != state_file_name:
+            raise ResearchSessionError("state_file_name must be a plain file name")
         self.project_dir = Path(project_dir).resolve()
         self.research_dir = self.project_dir / "research"
-        self.state_path = self.research_dir / SESSION_FILE_NAME
-        self.lock_path = self.research_dir / ".codex-session.lock"
+        self.state_path = self.research_dir / state_file_name
+        lock_name = (
+            ".codex-session.lock"
+            if state_file_name == SESSION_FILE_NAME
+            else f".{Path(state_file_name).stem.replace('_', '-')}.lock"
+        )
+        self.lock_path = self.research_dir / lock_name
         self.client_factory = client_factory or (
             lambda: AppServerClient(
                 self.project_dir,

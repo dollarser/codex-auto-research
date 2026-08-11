@@ -58,6 +58,10 @@ App Server 进程内状态。多个独立 App Server 进程共享同一个 `CODE
 - 同一 Goal 的 session bootstrap、Supervisor 和实验暂停控制全部连接该 daemon。
 - 禁止为该 Thread 启动另一个独立 `codex app-server --stdio`。
 
+Supervisor 默认使用 `research/supervisor_session.json` 创建或复用独立 Thread。
+`--adopt-session` 才允许复用 `research/codex_session.json`；是否接管现有会话必须由
+操作者显式选择，不能根据项目已有绑定静默决定。
+
 多个 WebSocket connection 是同一进程内的多个订阅者，不等于多个 Goal
 scheduler。`codex app-server proxy` 透传的是 WebSocket 字节流，不接收 App Server
 JSONL；Supervisor 因此直接执行 WebSocket 握手，并关闭 compression 扩展。
@@ -159,7 +163,8 @@ Supervisor启动顺序有意区分 active run：
 
 | 文件 | 用途 |
 |---|---|
-| `research/codex_session.json` | 专用 Thread ID、objective 和项目绑定 |
+| `research/supervisor_session.json` | 默认 Supervisor 专用 Thread 绑定 |
+| `research/codex_session.json` | 可选 `--adopt-session` 的既有 Thread 绑定 |
 | `research/active_experiment.json` | 当前非终态 run 提示 |
 | `research/supervisor/state.json` | monitor 状态、Turn ID、run、终态结果 |
 | `research/supervisor/experiment_handoff.json` | start tool 已暂停 Goal 的证据 |

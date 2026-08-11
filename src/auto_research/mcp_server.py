@@ -176,10 +176,14 @@ class ExperimentService:
                 "to wake a task that did not submit this experiment"
             )
         selected_thread_id = thread_id or environment_thread_id or bound_thread_id
+        supervisor_owned = is_supervisor_thread(
+            self.project_dir, selected_thread_id
+        )
         if (
             bound_thread_id
             and selected_thread_id
             and selected_thread_id != bound_thread_id
+            and not supervisor_owned
         ):
             raise ValueError(
                 f"project is bound to dedicated thread {bound_thread_id}, but the "
@@ -187,7 +191,6 @@ class ExperimentService:
                 "dedicated task or remove the project binding intentionally"
             )
         thread_id = selected_thread_id
-        supervisor_owned = is_supervisor_thread(self.project_dir, thread_id)
         wake_enabled = self.config.auto_wake and not supervisor_owned
         with self._submission_lock():
             if self.config.one_active_experiment:

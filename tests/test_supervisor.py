@@ -192,6 +192,48 @@ class SupervisorTests(unittest.TestCase):
             with self.assertRaisesRegex(SupervisorError, "operator-paused"):
                 supervisor.resume()
 
+    def test_supervisor_session_mode_is_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            dedicated = GoalRuntimeSupervisor(project).session_factory()
+            adopted = GoalRuntimeSupervisor(
+                project, adopt_session=True
+            ).session_factory()
+
+            self.assertEqual(dedicated.state_path.name, "supervisor_session.json")
+            self.assertEqual(adopted.state_path.name, "codex_session.json")
+
+    def test_dedicated_supervisor_waits_for_foreign_run_without_takeover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            write_goal(project)
+            runner, run_id = write_terminal_run(project, thread_id="desktop-thread")
+            write_json_atomic(
+                project / "research" / "active_experiment.json",
+                {"run_id": run_id},
+            )
+
+            def complete_goal(client, turn_count):
+                client.goal["status"] = "complete"
+
+            client = FakeGoalClient(on_turn_completed=complete_goal)
+            result = GoalRuntimeSupervisor(
+                project,
+                client_factory=lambda: client,
+                session_factory=lambda: FakeSession("supervisor-thread"),
+                runner=runner,
+            ).run()
+
+            self.assertEqual(result["state"], "COMPLETED")
+            self.assertEqual(result["foreign_thread_id"], "desktop-thread")
+            self.assertTrue(client.injected)
+            self.assertFalse(
+                any(
+                    call[:2] == ("goal", "desktop-thread")
+                    for call in client.calls
+                )
+            )
+
     def test_experiment_terminal_reactivates_native_goal(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -258,6 +300,15 @@ class SupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
+            write_json_atomic(
+                project / "research" / "codex_session.json",
+                {
+                    "schema_version": 1,
+                    "project_root": str(project.resolve()),
+                    "thread_id": "desktop-thread",
+                    "setup_state": "ready",
+                },
+            )
             write_json_atomic(
                 supervisor_dir(project) / "state.json",
                 {

@@ -15,10 +15,11 @@ from typing import Any
 
 from .app_server import AppServerClient, AppServerTimeout
 from .ledger import read_json, write_json_atomic
-from .research_session import ResearchSessionManager
+from .research_session import SESSION_FILE_NAME, ResearchSessionManager
 from .runner import ExperimentRunner
 
 STATE_SCHEMA_VERSION = 2
+SUPERVISOR_SESSION_FILE_NAME = "supervisor_session.json"
 OPERATOR_STATES = {
     "NEEDS_USER",
     "RECOVERY_ERROR",
@@ -104,6 +105,7 @@ class GoalRuntimeSupervisor:
         client_factory: Callable[[], Any] | None = None,
         session_factory: Callable[[], Any] | None = None,
         runner: ExperimentRunner | None = None,
+        adopt_session: bool = False,
     ):
         self.project_dir = Path(project_dir).resolve()
         self.control_dir = supervisor_dir(self.project_dir)
@@ -112,6 +114,7 @@ class GoalRuntimeSupervisor:
         self.active_experiment_path = (
             self.project_dir / "research" / "active_experiment.json"
         )
+        self.adopt_session = adopt_session
         self.client_factory = client_factory or (
             lambda: AppServerClient(
                 self.project_dir,
@@ -121,7 +124,14 @@ class GoalRuntimeSupervisor:
             )
         )
         self.session_factory = session_factory or (
-            lambda: ResearchSessionManager(self.project_dir)
+            lambda: ResearchSessionManager(
+                self.project_dir,
+                state_file_name=(
+                    SESSION_FILE_NAME
+                    if self.adopt_session
+                    else SUPERVISOR_SESSION_FILE_NAME
+                ),
+            )
         )
         self.runner = runner or ExperimentRunner(self.project_dir / "research" / "runs")
 
@@ -148,6 +158,7 @@ class GoalRuntimeSupervisor:
             {
                 "schema_version": STATE_SCHEMA_VERSION,
                 "project_root": str(self.project_dir),
+                "session_mode": "adopted" if self.adopt_session else "dedicated",
                 "updated_at": time.time(),
             }
         )
@@ -218,6 +229,25 @@ class GoalRuntimeSupervisor:
             raise SupervisorError("Goal did not become active after experiment")
         return result
 
+    def _wait_foreign_experiment(
+        self, client: Any, thread_id: str, run_id: str, run: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Wait for a predecessor run without controlling its owning Goal."""
+        self._write_state(
+            state="FOREIGN_EXPERIMENT_WAITING",
+            waiting_run_id=run_id,
+            foreign_thread_id=run.get("codex_thread_id"),
+        )
+        result = self.runner.wait(run_id).to_dict()
+        self._clear_active_experiment(run_id)
+        client.inject_items(thread_id, self._terminal_context(result))
+        self._write_state(
+            state="BOOTSTRAPPING",
+            waiting_run_id=None,
+            last_foreign_terminal_result=result,
+        )
+        return result
+
     def _after_goal_turn(
         self, client: Any, thread_id: str, completed: dict[str, Any]
     ) -> str:
@@ -259,6 +289,7 @@ class GoalRuntimeSupervisor:
             with self.client_factory() as client:
                 client.initialize()
                 run_id = active_experiment_id(self.project_dir)
+                run = self.runner.get_run(run_id) if run_id else None
                 if run_id:
                     # Pause before resume: resuming an active idle Goal itself can
                     # launch a continuation inside the managed daemon.
@@ -266,7 +297,13 @@ class GoalRuntimeSupervisor:
                 thread = client.resume_thread(thread_id)
 
                 if run_id:
-                    self._wait_experiment_and_activate(client, thread_id, run_id)
+                    if run and run.get("codex_thread_id") == thread_id:
+                        self._wait_experiment_and_activate(client, thread_id, run_id)
+                    else:
+                        assert run is not None
+                        self._wait_foreign_experiment(
+                            client, thread_id, run_id, run
+                        )
                 # thread/resume doesn't guarantee that Turn history is included.
                 # Re-read after any Goal mutation so a continuation that started
                 # before this monitor subscribed isn't mistaken for a wake failure.
@@ -323,13 +360,24 @@ class GoalRuntimeSupervisor:
 AppServerSupervisor = GoalRuntimeSupervisor
 
 
-def spawn_supervisor(project_dir: str | Path) -> dict[str, Any]:
+def spawn_supervisor(
+    project_dir: str | Path, *, adopt_session: bool = False
+) -> dict[str, Any]:
     project = Path(project_dir).resolve()
     control = supervisor_dir(project)
     control.mkdir(parents=True, exist_ok=True)
     log = (control / "supervisor.log").open("ab")
+    command = [
+        sys.executable,
+        "-m",
+        "auto_research.supervisor",
+        "--project",
+        str(project),
+    ]
+    if adopt_session:
+        command.append("--adopt-session")
     process = subprocess.Popen(
-        [sys.executable, "-m", "auto_research.supervisor", "--project", str(project)],
+        command,
         cwd=project,
         stdin=subprocess.DEVNULL,
         stdout=log,
@@ -353,8 +401,15 @@ def spawn_supervisor(project_dir: str | Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m auto_research.supervisor")
     parser.add_argument("--project", default=".")
+    parser.add_argument(
+        "--adopt-session",
+        action="store_true",
+        help="reuse research/codex_session.json instead of a dedicated session",
+    )
     args = parser.parse_args(argv)
-    state = GoalRuntimeSupervisor(args.project).run()
+    state = GoalRuntimeSupervisor(
+        args.project, adopt_session=args.adopt_session
+    ).run()
     print(json.dumps(state, ensure_ascii=False, indent=2))
     return 0 if state.get("state") == "COMPLETED" else 1
 

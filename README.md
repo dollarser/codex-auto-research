@@ -67,6 +67,14 @@ codex app-server daemon start
 uv run auto-research supervisor start --project /path/to/project
 ```
 
+默认创建并复用 `research/supervisor_session.json` 绑定的独立 App Server Thread，
+不会接管 `research/codex_session.json` 中已有的 Desktop/旧 Listener 会话。只有明确
+需要接管时才使用：
+
+```bash
+uv run auto-research supervisor start --project /path/to/project --adopt-session
+```
+
 前台诊断：
 
 ```bash
@@ -83,7 +91,7 @@ uv run auto-research supervisor resume --project /path/to/project
 `resume` 只允许用于 `NEEDS_USER` / `RECOVERY_ERROR`，会重置持久状态并重新启动
 detached Supervisor；它不是向 Thread 发送 `/goal resume` 文本。
 
-首次运行会幂等创建项目专用 Thread 和 Goal。Goal 初始 `paused`；Supervisor连接
+首次运行会幂等创建 Supervisor 专用 Thread 和 Goal。Goal 初始 `paused`；Supervisor连接
 managed daemon 后设置 `active`，由 Goal runtime 自动产生第一个 continuation。
 
 ## 实验交接
@@ -109,6 +117,7 @@ Goal Turn 调用 `start_experiment` 后，返回：
 ```text
 research/
 ├── codex_session.json
+├── supervisor_session.json
 ├── active_experiment.json
 ├── supervisor/
 │   ├── state.json
