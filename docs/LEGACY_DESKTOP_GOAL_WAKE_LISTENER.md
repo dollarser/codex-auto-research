@@ -1,4 +1,23 @@
-# v0.3 当前方案：Codex Goal + One-shot Wake Listener
+# Legacy v0.3：Desktop Goal + One-shot Wake Listener
+
+> **Legacy compatibility only.** 本方案不属于 `main` 的默认运行链路，默认配置
+> `listener.auto_wake=false`。新研究任务必须使用 managed App Server Supervisor；
+> 只有维护既有 Desktop Goal 任务时才显式启用本 Listener。正式架构见
+> [App Server Supervisor](AUTO_RESEARCH_SUPERVISOR_SCHEDULER_DESIGN.md)。
+
+## 显式启用
+
+仅对已有 Desktop Goal 任务，在项目配置中显式开启：
+
+```toml
+[listener]
+auto_wake = true
+```
+
+新项目和 `auto-research init` 默认写入 `false`。main 已删除公开 MCP
+`start_experiment`；本文后续出现的该名称和 `auto-research start` 都只描述历史 v0.3
+行为，不是当前可用入口。`recover-wakes` 不会恢复禁用的历史 Listener，`arm-wake`
+与 `recover-wakes` 命令均应视为 legacy 运维入口。
 
 ## 1. 设计目标
 
@@ -12,7 +31,7 @@ Codex Goal 保留完整研究自主权；外部代码只解决长实验与暂停
 4. 终态事件只触发一次对原 Goal 的恢复。
 5. 不引入 Harness cycle、阶段编排或外部停止判断。
 
-## 2. 当前架构图
+## 2. Legacy 架构图
 
 ```mermaid
 flowchart TD
@@ -30,7 +49,7 @@ flowchart TD
 
     subgraph E["实验执行面"]
         direction TB
-        API["auto-research start<br/>或可选 Experiment MCP"]
+        API["历史 auto-research start<br/>或历史 start_experiment MCP"]
         R["ExperimentRunner<br/>持久化并提交"]
         W["detached Worker<br/>训练 / 评估"]
         L["one-shot Goal Wake Listener<br/>只恢复一次"]
@@ -224,7 +243,7 @@ Turn。
 
 官方 App Server 协议把 `thread/resume` 定义为重新打开已有 thread，把 `turn/start` 定义为启动生成；而桌面端本身已经是该 thread 的执行宿主。真实验证发现，Listener 再启动一个独立 App Server 并调用 `thread/resume` 会与桌面端争抢 writer，出现 `already has an active writer`。
 
-因此当前 Listener 只使用不创建新 turn、不接管 writer 的接口：
+因此 legacy Listener 只使用不创建新 turn、不接管 writer 的接口：
 
 1. `thread/goal/get` 核对 Goal 与精确 thread 绑定。
 2. 等待期间不改变 active Goal，也不观察或中断 Turn。

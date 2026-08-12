@@ -1,8 +1,8 @@
 """Experiment lifecycle MCP server.
 
-The server exposes only deterministic experiment tools. Research decisions
-remain in Codex Goal; this process owns durable run submission, result
-retrieval, and cancellation.
+The server exposes deterministic experiment read/wait tools. Research decisions
+remain in Codex Goal; durable submission uses ``auto-research submit`` CLI so
+that it does not depend on an App Server MCP approval prompt.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -25,33 +24,25 @@ from .supervisor import (
     pause_goal_for_experiment,
     supervisor_active_experiment_path,
 )
+from .state_paths import resolve_state_root
 
 
 class ExperimentService:
-    def __init__(
-        self,
-        project_dir: str | Path | None = None,
-        *,
-        wake_launcher: Callable[..., dict[str, Any]] | None = None,
-    ):
+    def __init__(self, project_dir: str | Path | None = None, state_root: str | Path | None = None):
         self.project_dir = Path(
             project_dir or os.environ.get("AUTO_RESEARCH_PROJECT_DIR", ".")
         ).resolve()
+        self.state_root = resolve_state_root(self.project_dir, state_root or os.environ.get("AUTO_RESEARCH_STATE_ROOT"))
         self.config = load_config(self.project_dir)
         self.runner = ExperimentRunner(
-            self.project_dir / "research" / "runs", config=self.config
+            self.state_root / "runs", config=self.config
         )
         self.submission_lock_path = (
-            self.project_dir / "research" / "experiment_submission.lock"
+            self.state_root / "experiment_submission.lock"
         )
         self.active_submission_path = (
-            self.project_dir / "research" / "active_experiment.json"
+            self.state_root / "active_experiment.json"
         )
-        if wake_launcher is None:
-            from .wake_listener import spawn_wake_listener
-
-            wake_launcher = spawn_wake_listener
-        self.wake_launcher = wake_launcher
 
     @contextmanager
     def _submission_lock(self):
@@ -95,7 +86,7 @@ class ExperimentService:
 
         # Recover the marker if the MCP process died immediately after submit.
         for run_file in sorted(
-            self.project_dir.joinpath("research", "runs").glob("run-*/run.json")
+            self.state_root.joinpath("runs").glob("run-*/run.json")
         ):
             run = read_json(run_file, {}) or {}
             if (
@@ -108,7 +99,7 @@ class ExperimentService:
     def _release_active(self, run_id: str) -> None:
         for marker_path in (
             self.active_submission_path,
-            supervisor_active_experiment_path(self.project_dir),
+            supervisor_active_experiment_path(self.project_dir, self.state_root),
         ):
             active = read_json(marker_path, {}) or {}
             if active.get("run_id") == run_id:
@@ -162,7 +153,7 @@ class ExperimentService:
             "hard_requirements": goal.hard_requirements,
         }
 
-    def start_experiment(
+    def submit_experiment(
         self,
         idea_id: str,
         worktree: str,
@@ -180,39 +171,26 @@ class ExperimentService:
         resolved = self._worktree(worktree)
         snapshot = self._goal_contract_snapshot()
         environment_thread_id = os.environ.get("CODEX_THREAD_ID") or None
-        bound_thread_id = read_bound_thread_id(self.project_dir)
+        bound_thread_id = read_bound_thread_id(self.project_dir, self.state_root)
         if thread_id and environment_thread_id and thread_id != environment_thread_id:
             raise ValueError(
                 "thread_id does not match the current CODEX_THREAD_ID; refusing "
                 "to wake a task that did not submit this experiment"
             )
         selected_thread_id = thread_id or environment_thread_id or bound_thread_id
-        supervisor_owned = is_supervisor_thread(
-            self.project_dir, selected_thread_id
-        )
-        if (
-            bound_thread_id
-            and selected_thread_id
-            and selected_thread_id != bound_thread_id
-            and not supervisor_owned
-        ):
+        supervisor_owned = is_supervisor_thread(self.project_dir, selected_thread_id, self.state_root)
+        if not supervisor_owned:
             raise ValueError(
-                f"project is bound to dedicated thread {bound_thread_id}, but the "
-                f"experiment was submitted from {selected_thread_id}; open the "
-                "dedicated task or remove the project binding intentionally"
+                "submit_experiment requires the project-bound managed Supervisor "
+                "Goal task; experiment Workers may only be launched by Supervisor"
             )
         thread_id = selected_thread_id
-        wake_enabled = self.config.auto_wake and not supervisor_owned
-        marker_path = (
-            supervisor_active_experiment_path(self.project_dir)
-            if supervisor_owned
-            else self.active_submission_path
-        )
+        marker_path = supervisor_active_experiment_path(self.project_dir, self.state_root)
         with self._submission_lock():
             if self.config.one_active_experiment:
                 active_run_id = self._active_run_id(
                     marker_path,
-                    thread_id=thread_id if supervisor_owned else None,
+                    thread_id=thread_id,
                 )
                 if active_run_id:
                     raise RuntimeError(
@@ -229,10 +207,10 @@ class ExperimentService:
                 goal_contract_digest=snapshot.get("digest"),
                 goal_contract_revision=snapshot.get("revision"),
                 hard_requirements_snapshot=snapshot.get("hard_requirements", []),
-                wake_enabled=wake_enabled,
+                wake_enabled=False,
                 codex_thread_id=thread_id,
                 pause_goal_on_turn_end=False,
-                launch_worker=True,
+                launch_worker=False,
             )
             if self.config.one_active_experiment:
                 write_json_atomic(
@@ -243,32 +221,16 @@ class ExperimentService:
                         "wait_requested": False,
                     },
                 )
-        wake: dict[str, Any] = {"status": "DISABLED"}
-        goal_pause: dict[str, Any] = {
-            "status": "NOT_REQUESTED",
-            "continuation_allowed": True,
-        }
-        if wake_enabled:
-            try:
-                wake = self.wake_launcher(
-                    self.project_dir,
-                    run_id,
-                    thread_id=thread_id,
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                wake = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
-                write_json_atomic(
-                    self.runner.runs_dir / run_id / "wake-launch-error.json", wake
-                )
         return {
             "run_id": run_id,
-            "status": "RUNNING",
+            "status": "SUBMITTED",
             "worktree": str(resolved),
-            "wake_listener": wake,
-            "goal_pause": goal_pause,
-            "scheduler": "app_server_goal_runtime"
-            if supervisor_owned
-            else "goal_wake_listener",
+            "worker_owner": "supervisor",
+            "goal_pause": {
+                "status": "NOT_REQUESTED",
+                "continuation_allowed": True,
+            },
+            "scheduler": "app_server_supervisor",
         }
 
     def wait_for_experiment(
@@ -280,7 +242,7 @@ class ExperimentService:
             raise ValueError("thread_id does not match the current CODEX_THREAD_ID")
         selected_thread_id = thread_id or environment_thread_id
         if not selected_thread_id or not is_supervisor_thread(
-            self.project_dir, selected_thread_id
+            self.project_dir, selected_thread_id, self.state_root
         ):
             raise ValueError(
                 "wait_for_experiment requires the managed Supervisor Goal task"
@@ -293,7 +255,7 @@ class ExperimentService:
             }
         with self._submission_lock():
             active = read_json(
-                supervisor_active_experiment_path(self.project_dir), {}
+                supervisor_active_experiment_path(self.project_dir, self.state_root), {}
             ) or {}
             if active.get("run_id") != run_id:
                 raise ValueError("run_id is not the Supervisor's active experiment")
@@ -314,12 +276,14 @@ class ExperimentService:
             with self._submission_lock():
                 result = self.runner.get_result(run_id)
                 if result is None:
-                    return {"run_id": run_id, "status": "RUNNING"}
+                    run = self.runner.get_run(run_id)
+                    return {"run_id": run_id, "status": run.get("status")}
                 self._release_active(run_id)
         else:
             result = self.runner.get_result(run_id)
             if result is None:
-                return {"run_id": run_id, "status": "RUNNING"}
+                run = self.runner.get_run(run_id)
+                return {"run_id": run_id, "status": run.get("status")}
         return result.to_dict()
 
     def cancel_experiment(self, run_id: str) -> dict[str, Any]:
@@ -340,25 +304,6 @@ def main() -> None:
 
     service = ExperimentService()
     server = FastMCP("auto-research-experiments")
-
-    @server.tool()
-    def start_experiment(
-        idea_id: str,
-        worktree: str,
-        command: str,
-        timeout_s: int | None = None,
-        idempotency_key: str | None = None,
-        thread_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Persist and start a detached experiment; returns immediately with run_id."""
-        return service.start_experiment(
-            idea_id,
-            worktree,
-            command,
-            timeout_s,
-            idempotency_key=idempotency_key,
-            thread_id=thread_id,
-        )
 
     @server.tool()
     def get_experiment_result(run_id: str) -> dict[str, Any]:

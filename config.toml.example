@@ -1,8 +1,15 @@
 # Copy to <project>/research/config.toml.
 # Environment variables AUTO_RESEARCH_* override these values.
 
+[codex]
+model = "gpt-5.6-terra"
+approval_policy = "never"
+sandbox = "workspace-write"
+
+# Legacy Desktop compatibility only. Keep disabled for the managed App Server
+# Supervisor. Set true explicitly only for an existing Desktop Listener task.
 [listener]
-auto_wake = true
+auto_wake = false
 app_server_response_timeout_s = 60.0
 bind_recency_s = 600.0
 reconnect_initial_s = 2.0

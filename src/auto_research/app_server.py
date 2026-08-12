@@ -297,8 +297,50 @@ class AppServerClient:
             raise AppServerError("thread/read did not return a thread")
         return thread
 
-    def resume_thread(self, thread_id: str) -> dict[str, Any]:
-        response = self._response(self._send("thread/resume", {"threadId": thread_id}))
+    def list_models(self, *, include_hidden: bool = False) -> list[dict[str, Any]]:
+        response = self._response(
+            self._send(
+                "model/list",
+                {"limit": 100, "includeHidden": include_hidden},
+            )
+        )
+        data = response.get("result", {}).get("data", [])
+        if not isinstance(data, list):
+            raise AppServerError("model/list did not return a model list")
+        return [item for item in data if isinstance(item, dict)]
+
+    def require_model(self, model: str) -> dict[str, Any]:
+        models = self.list_models(include_hidden=True)
+        for item in models:
+            if item.get("model") == model or item.get("id") == model:
+                return item
+        available = sorted(
+            {
+                str(item.get("model") or item.get("id"))
+                for item in models
+                if item.get("model") or item.get("id")
+            }
+        )
+        raise AppServerError(
+            f"configured Codex model {model!r} is unavailable; available={available}"
+        )
+
+    def resume_thread(
+        self,
+        thread_id: str,
+        *,
+        model: str | None = None,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"threadId": thread_id}
+        if model is not None:
+            params["model"] = model
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
+        if sandbox is not None:
+            params["sandbox"] = sandbox
+        response = self._response(self._send("thread/resume", params))
         thread = response.get("result", {}).get("thread", {})
         if not isinstance(thread, dict) or thread.get("id") != thread_id:
             raise AppServerError("thread/resume did not return the requested thread")
@@ -416,12 +458,23 @@ class AppServerClient:
             )
         )
 
-    def start_thread(self, *, service_name: str) -> dict[str, Any]:
+    def start_thread(
+        self,
+        *,
+        service_name: str,
+        model: str | None = None,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"cwd": self.cwd, "serviceName": service_name}
+        if model is not None:
+            params["model"] = model
+        if approval_policy is not None:
+            params["approvalPolicy"] = approval_policy
+        if sandbox is not None:
+            params["sandbox"] = sandbox
         response = self._response(
-            self._send(
-                "thread/start",
-                {"cwd": self.cwd, "serviceName": service_name},
-            )
+            self._send("thread/start", params)
         )
         thread = response.get("result", {}).get("thread", {})
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):

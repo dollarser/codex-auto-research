@@ -150,12 +150,20 @@ class FakeSessionAppServer:
     def initialize(self):
         self.calls.append(("initialize",))
 
-    def start_thread(self, *, service_name):
+    def require_model(self, model):
+        self.calls.append(("require_model", model))
+        return {"id": model, "model": model, "isDefault": True}
+
+    def start_thread(
+        self, *, service_name, model=None, approval_policy=None, sandbox=None
+    ):
         self.start_count += 1
         thread_id = f"thread-{self.start_count}"
         thread = {"id": thread_id, "cwd": str(self.project)}
         self.threads[thread_id] = thread
-        self.calls.append(("start", service_name, str(self.project)))
+        self.calls.append(
+            ("start", service_name, str(self.project), model, approval_policy, sandbox)
+        )
         return thread
 
     def read_thread(self, thread_id):
@@ -283,7 +291,7 @@ class AgentTests(unittest.TestCase):
                     project, client_factory=lambda: client
                 ).prepare(thread_id="wrong-thread")
 
-    def test_cli_start_does_not_confuse_subcommand_with_experiment_command(self):
+    def test_cli_submit_persists_command_without_starting_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
@@ -291,6 +299,15 @@ class AgentTests(unittest.TestCase):
             (project / "research" / "config.toml").write_text(
                 "[listener]\nauto_wake=false\n",
                 encoding="utf-8",
+            )
+            write_json_atomic(
+                project / "research" / "supervisor" / "state.json",
+                {
+                    "schema_version": 3,
+                    "project_root": str(project.resolve()),
+                    "thread_id": "thread-supervisor",
+                    "state": "GOAL_RUNNING",
+                },
             )
             code = (
                 "import json,os,pathlib; "
@@ -301,28 +318,32 @@ class AgentTests(unittest.TestCase):
             previous = sys.stdout
             sys.stdout = output
             try:
-                exit_code = cli_main(
-                    [
-                        "start",
-                        "--project",
-                        str(project),
-                        "--idea-id",
-                        "cli-smoke",
-                        "--worktree",
-                        str(project),
-                        "--command",
-                        f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
-                    ]
-                )
+                with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):
+                    exit_code = cli_main(
+                        [
+                            "submit",
+                            "--project",
+                            str(project),
+                            "--idea-id",
+                            "cli-smoke",
+                            "--worktree",
+                            str(project),
+                            "--command",
+                            f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+                            "--thread-id",
+                            "thread-supervisor",
+                        ]
+                    )
             finally:
                 sys.stdout = previous
             payload = json.loads(output.getvalue())
             self.assertEqual(exit_code, 0)
-            self.assertEqual(payload["status"], "RUNNING")
-            result = ExperimentRunner(project / "research" / "runs").wait(
-                payload["run_id"], poll_s=0.02
+            self.assertEqual(payload["status"], "SUBMITTED")
+            run = ExperimentRunner(project / "research" / "runs").get_run(
+                payload["run_id"]
             )
-            self.assertEqual(result.status, "COMPLETED")
+            self.assertEqual(run["status"], "SUBMITTED")
+            self.assertIsNone(run.get("worker_pid"))
 
     def test_config_file_and_environment_override(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,6 +366,27 @@ class AgentTests(unittest.TestCase):
             self.assertFalse(config.auto_wake)
             self.assertFalse(config.use_shell)
             self.assertEqual(config.reconnect_max_s, 13)
+            self.assertEqual(config.codex_model, "gpt-5.6-terra")
+            self.assertEqual(config.codex_approval_policy, "never")
+            self.assertEqual(config.codex_sandbox, "workspace-write")
+
+    def test_legacy_desktop_listener_is_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(tmp)
+
+            self.assertFalse(config.auto_wake)
+
+    def test_cli_init_writes_legacy_listener_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                exit_code = cli_main(["init", tmp])
+
+            self.assertEqual(exit_code, 0)
+            config = (Path(tmp) / "research" / "config.toml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("auto_wake = false", config)
 
     def test_register_mcp_preserves_other_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -366,120 +408,72 @@ class AgentTests(unittest.TestCase):
     def test_render_mcp_uses_virtualenv_entrypoint(self):
         rendered = render_mcp_config(".", "/tmp/project/.venv/bin/python")
         self.assertIn('command = "/tmp/project/.venv/bin/python"', rendered)
+        self.assertIn("required = true", rendered)
 
-    def test_experiment_service_starts_worker_and_arms_listener(self):
+    def test_submit_experiment_requires_managed_supervisor_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
-            launches: list[dict] = []
+            service = ExperimentService(project)
 
-            def launcher(project_dir, run_id, *, thread_id=None):
-                launches.append(
-                    {
-                        "project": str(project_dir),
-                        "run_id": run_id,
-                        "thread_id": thread_id,
-                    }
-                )
-                return {"status": "ARMED", "pid": 123, "thread_id": thread_id}
-
-            service = ExperimentService(project, wake_launcher=launcher)
-            code = (
-                "import json,os,pathlib; "
-                "pathlib.Path(os.environ['AUTO_RESEARCH_RUN_DIR'],'metrics.json')"
-                ".write_text(json.dumps({'score': 1.0}))"
-            )
             with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):
-                result = service.start_experiment(
-                    "idea-one",
-                    ".",
-                    f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
-                    30,
-                    thread_id="thread-current",
-                )
-            terminal = service.runner.wait(result["run_id"], poll_s=0.02)
-            self.assertEqual(terminal.status, "COMPLETED")
-            self.assertEqual(result["wake_listener"]["status"], "ARMED")
-            self.assertEqual(launches[0]["thread_id"], "thread-current")
-            run = service.runner.get_run(result["run_id"])
-            self.assertEqual(run["runtime_version"], 3)
-            self.assertTrue(run["wake_enabled"])
-            self.assertEqual(run["codex_thread_id"], "thread-current")
-            self.assertFalse(run["pause_goal_on_turn_end"])
+                with self.assertRaisesRegex(ValueError, "managed Supervisor"):
+                    service.submit_experiment(
+                        "idea-one", ".", "python train.py", 30, thread_id="thread-any"
+                    )
 
-    def test_experiment_started_from_codex_allows_continuations(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            write_goal(project)
-            service = ExperimentService(
-                project,
-                wake_launcher=lambda *args, **kwargs: {"status": "ARMED"},
-            )
-            code = (
-                "import json,os,pathlib; "
-                "pathlib.Path(os.environ['AUTO_RESEARCH_RUN_DIR'],'metrics.json')"
-                ".write_text(json.dumps({'score': 1.0}))"
-            )
-            previous = os.environ.get("CODEX_THREAD_ID")
-            os.environ["CODEX_THREAD_ID"] = "thread-current"
-            try:
-                result = service.start_experiment(
-                    "idea-one",
-                    ".",
-                    f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
-                    30,
-                )
-            finally:
-                if previous is None:
-                    os.environ.pop("CODEX_THREAD_ID", None)
-                else:
-                    os.environ["CODEX_THREAD_ID"] = previous
-            run = service.runner.get_run(result["run_id"])
-            self.assertFalse(run["pause_goal_on_turn_end"])
-            self.assertEqual(run["codex_thread_id"], "thread-current")
-
-    def test_experiment_uses_persisted_dedicated_thread_outside_codex(self):
+    def test_submit_experiment_defers_worker_launch_to_supervisor(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
             write_json_atomic(
-                project / "research" / "codex_session.json",
+                project / "research" / "supervisor" / "state.json",
                 {
-                    "schema_version": 1,
+                    "schema_version": 3,
                     "project_root": str(project.resolve()),
-                    "thread_id": "thread-dedicated",
-                    "setup_state": "ready",
+                    "thread_id": "thread-supervisor",
+                    "state": "GOAL_RUNNING",
                 },
             )
-            launches: list[str | None] = []
-            service = ExperimentService(
-                project,
-                wake_launcher=lambda *args, thread_id=None, **kwargs: (
-                    launches.append(thread_id)
-                    or {"status": "ARMED", "thread_id": thread_id}
-                ),
-            )
-            code = (
-                "import json,os,pathlib; "
-                "pathlib.Path(os.environ['AUTO_RESEARCH_RUN_DIR'],'metrics.json')"
-                ".write_text(json.dumps({'score': 1.0}))"
-            )
+            service = ExperimentService(project)
 
-            with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):
-                result = service.start_experiment(
-                    "idea-dedicated",
+            with (
+                patch.dict(os.environ, {"CODEX_THREAD_ID": ""}),
+                patch.object(service.runner, "submit", return_value="run-test") as submit,
+            ):
+                result = service.submit_experiment(
+                    "idea-one",
                     ".",
-                    f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+                    "python train.py",
                     30,
+                    thread_id="thread-supervisor",
                 )
-            service.runner.wait(result["run_id"], poll_s=0.02)
 
-            self.assertEqual(launches, ["thread-dedicated"])
-            run = service.runner.get_run(result["run_id"])
-            self.assertEqual(run["codex_thread_id"], "thread-dedicated")
-            self.assertFalse(run["pause_goal_on_turn_end"])
+            self.assertEqual(result["status"], "SUBMITTED")
+            self.assertEqual(result["scheduler"], "app_server_supervisor")
+            self.assertEqual(result["worker_owner"], "supervisor")
+            self.assertFalse(submit.call_args.kwargs["launch_worker"])
+            self.assertFalse(submit.call_args.kwargs["wake_enabled"])
+            with (
+                patch.object(service.runner, "get_result", return_value=None),
+                patch.object(
+                    service.runner,
+                    "get_run",
+                    return_value={"run_id": "run-test", "status": "SUBMITTED"},
+                ),
+            ):
+                self.assertEqual(
+                    service.get_experiment_result("run-test")["status"],
+                    "SUBMITTED",
+                )
+            marker = json.loads(
+                (project / "research" / "supervisor" / "active_experiment.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["run_id"], "run-test")
+            self.assertFalse(marker["wait_requested"])
 
-    def test_experiment_rejects_current_thread_that_differs_from_binding(self):
+    def test_submit_rejects_thread_that_is_not_managed_by_supervisor(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
@@ -496,8 +490,8 @@ class AgentTests(unittest.TestCase):
             previous = os.environ.get("CODEX_THREAD_ID")
             os.environ["CODEX_THREAD_ID"] = "thread-other"
             try:
-                with self.assertRaisesRegex(ValueError, "dedicated thread"):
-                    service.start_experiment(
+                with self.assertRaisesRegex(ValueError, "managed Supervisor"):
+                    service.submit_experiment(
                         "idea-wrong-thread", ".", "python train.py", 30
                     )
             finally:
@@ -510,10 +504,16 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
-            service = ExperimentService(
-                project,
-                wake_launcher=lambda *args, **kwargs: {"status": "ARMED"},
+            write_json_atomic(
+                project / "research" / "supervisor" / "state.json",
+                {
+                    "schema_version": 3,
+                    "project_root": str(project.resolve()),
+                    "thread_id": "t1",
+                    "state": "GOAL_RUNNING",
+                },
             )
+            service = ExperimentService(project)
             code = (
                 "import json,os,pathlib; "
                 "pathlib.Path(os.environ['AUTO_RESEARCH_RUN_DIR'],'metrics.json')"
@@ -521,7 +521,7 @@ class AgentTests(unittest.TestCase):
             )
             command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
             with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):
-                first = service.start_experiment(
+                first = service.submit_experiment(
                     "idea-one",
                     ".",
                     command,
@@ -529,8 +529,10 @@ class AgentTests(unittest.TestCase):
                     idempotency_key="same",
                     thread_id="t1",
                 )
+                service.runner.launch(first["run_id"])
                 service.runner.wait(first["run_id"], poll_s=0.02)
-                second = service.start_experiment(
+                service.get_experiment_result(first["run_id"])
+                second = service.submit_experiment(
                     "idea-one",
                     ".",
                     command,
@@ -760,6 +762,20 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(recovered, [])
             spawn.assert_not_called()
 
+    def test_recover_wakes_does_not_reenable_disabled_legacy_listener(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            run_dir = write_terminal_run(project, "run-legacy-001")
+            run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            run.update({"runtime_version": 3, "wake_enabled": True})
+            write_json_atomic(run_dir / "run.json", run)
+
+            with patch("auto_research.wake_listener.spawn_wake_listener") as spawn:
+                recovered = recover_wake_listeners(project)
+
+            self.assertEqual(recovered, [])
+            spawn.assert_not_called()
+
     def test_app_server_list_threads_uses_exact_cwd_filter(self):
         stdin = io.StringIO()
         stream = io.StringIO(
@@ -822,15 +838,60 @@ class AgentTests(unittest.TestCase):
         client._stderr = deque()
         client.process = SimpleNamespace(stdin=stdin, stdout=stream)
 
-        thread = client.start_thread(service_name="auto-research-test")
+        thread = client.start_thread(
+            service_name="auto-research-test",
+            model="gpt-5.6-terra",
+            approval_policy="never",
+            sandbox="workspace-write",
+        )
 
         request = json.loads(stdin.getvalue())
         self.assertEqual(thread["id"], "thread-1")
         self.assertEqual(request["method"], "thread/start")
         self.assertEqual(
             request["params"],
-            {"cwd": "/tmp/project", "serviceName": "auto-research-test"},
+            {
+                "cwd": "/tmp/project",
+                "serviceName": "auto-research-test",
+                "model": "gpt-5.6-terra",
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            },
         )
+
+    def test_app_server_model_preflight_uses_account_catalog(self):
+        stdin = io.StringIO()
+        stream = io.StringIO(
+            json.dumps(
+                {
+                    "id": 1,
+                    "result": {
+                        "data": [
+                            {
+                                "id": "gpt-5.6-terra",
+                                "model": "gpt-5.6-terra",
+                                "isDefault": True,
+                            }
+                        ]
+                    },
+                }
+            )
+            + "\n"
+        )
+        client = AppServerClient.__new__(AppServerClient)
+        client.cwd = "/tmp/project"
+        client.config = SimpleNamespace(app_server_response_timeout_s=60.0)
+        client._next_id = 1
+        client._pending = deque()
+        client._stderr = deque()
+        client.process = SimpleNamespace(stdin=stdin, stdout=stream)
+
+        model = client.require_model("gpt-5.6-terra")
+
+        request = json.loads(stdin.getvalue())
+        self.assertEqual(model["model"], "gpt-5.6-terra")
+        self.assertEqual(request["method"], "model/list")
+        self.assertTrue(request["params"]["includeHidden"])
 
     def test_managed_app_server_accepts_long_thread_responses(self):
         lifecycle = SimpleNamespace(

@@ -1,4 +1,4 @@
-"""One-shot bridge from a durable experiment terminal event to a Codex Goal."""
+"""Legacy Desktop-only bridge from an experiment terminal event to a Goal."""
 
 from __future__ import annotations
 
@@ -522,6 +522,10 @@ def spawn_wake_listener(
 
 def recover_wake_listeners(project_dir: str | Path) -> list[dict[str, Any]]:
     project = Path(project_dir).resolve()
+    if not load_config(project).auto_wake:
+        # The Desktop listener is a legacy opt-in compatibility path. Turning
+        # it off must also prevent recovery from silently re-enabling it.
+        return []
     recovered: list[dict[str, Any]] = []
     for run_file in sorted(project.joinpath("research", "runs").glob("run-*/run.json")):
         run = read_json(run_file, {}) or {}

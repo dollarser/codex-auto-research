@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import time
 from pathlib import Path
 
 from .models import DEFAULT_MAX_EXPERIMENTS
@@ -23,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
         help="create once or reuse the project's dedicated Codex research task",
     )
     session.add_argument("--project", default=".")
+    session.add_argument("--state-root")
     session.add_argument(
         "--create-thread",
         action="store_true",
@@ -40,32 +43,57 @@ def main(argv: list[str] | None = None) -> int:
         help="allow --objective to replace an existing different Goal",
     )
 
-    start = sub.add_parser(
-        "start", help="start a detached experiment and arm Goal wake-up"
+    submit = sub.add_parser(
+        "submit", help="submit an experiment command for Supervisor to launch"
     )
-    start.add_argument("--project", default=".")
-    start.add_argument("--idea-id", required=True)
-    start.add_argument("--worktree", default=".")
-    start.add_argument("--command", required=True)
-    start.add_argument("--timeout-s", type=int)
-    start.add_argument("--idempotency-key")
-    start.add_argument("--thread-id")
+    submit.add_argument("--project", default=".")
+    submit.add_argument("--state-root")
+    submit.add_argument("--idea-id", required=True)
+    submit.add_argument("--worktree", default=".")
+    submit.add_argument("--command", required=True)
+    submit.add_argument("--timeout-s", type=int)
+    submit.add_argument("--idempotency-key")
+    submit.add_argument("--thread-id")
 
     status = sub.add_parser("status", help="show durable run and wake-listener state")
     status.add_argument("run_id")
     status.add_argument("--project", default=".")
+    status.add_argument("--state-root")
 
     wait = sub.add_parser("wait", help="wait locally for a durable run terminal event")
     wait.add_argument("run_id")
     wait.add_argument("--project", default=".")
+    wait.add_argument("--state-root")
 
-    arm = sub.add_parser("arm-wake", help="arm or run the one-shot Goal wake listener")
+    goal = sub.add_parser(
+        "goal",
+        help="change the managed research Goal state from its own Goal task",
+    )
+    goal_sub = goal.add_subparsers(dest="goal_action", required=True)
+    goal_status = goal_sub.add_parser(
+        "set-status", help="set the current managed Goal status"
+    )
+    goal_status.add_argument("status", choices=("active", "paused", "blocked", "complete"))
+    goal_status.add_argument("--project", default=".")
+    goal_status.add_argument("--state-root")
+    goal_status.add_argument(
+        "--thread-id",
+        help="only needed when CODEX_THREAD_ID is not available to the Goal shell",
+    )
+
+    arm = sub.add_parser(
+        "arm-wake",
+        help="[legacy Desktop only] explicitly arm the one-shot Goal listener",
+    )
     arm.add_argument("run_id")
     arm.add_argument("--project", default=".")
     arm.add_argument("--thread-id")
     arm.add_argument("--foreground", action="store_true")
 
-    recover = sub.add_parser("recover-wakes", help="restart unfinished wake listeners")
+    recover = sub.add_parser(
+        "recover-wakes",
+        help="[legacy Desktop only] recover listeners when auto_wake=true",
+    )
     recover.add_argument("--project", default=".")
 
     mcp = sub.add_parser("mcp-server", help="run the optional experiment MCP server")
@@ -88,21 +116,41 @@ def main(argv: list[str] | None = None) -> int:
     supervisor_sub = supervisor.add_subparsers(dest="supervisor_action", required=True)
     supervisor_run = supervisor_sub.add_parser("run", help="run in the foreground")
     supervisor_run.add_argument("--project", default=".")
-    supervisor_run.add_argument("--adopt-session", action="store_true")
+    supervisor_run.add_argument("--state-root")
+    supervisor_run.add_argument(
+        "--session-mode", choices=("auto", "dedicated", "adopted"), default="auto"
+    )
     supervisor_start = supervisor_sub.add_parser(
         "start", help="start a detached Supervisor process"
     )
     supervisor_start.add_argument("--project", default=".")
-    supervisor_start.add_argument("--adopt-session", action="store_true")
+    supervisor_start.add_argument("--state-root")
+    supervisor_start.add_argument(
+        "--session-mode", choices=("auto", "dedicated", "adopted"), default="auto"
+    )
     supervisor_status = supervisor_sub.add_parser(
         "status", help="show durable Supervisor state"
     )
     supervisor_status.add_argument("--project", default=".")
+    supervisor_status.add_argument("--state-root")
     supervisor_resume = supervisor_sub.add_parser(
         "resume", help="move an operator-paused Supervisor back to TURN_READY"
     )
     supervisor_resume.add_argument("--project", default=".")
-    supervisor_resume.add_argument("--adopt-session", action="store_true")
+    supervisor_resume.add_argument("--state-root")
+    supervisor_resume.add_argument(
+        "--session-mode", choices=("auto", "dedicated", "adopted"), default="auto"
+    )
+    supervisor_restart = supervisor_sub.add_parser(
+        "restart", help="reuse a completed session with an explicitly new Goal"
+    )
+    supervisor_restart.add_argument("--project", default=".")
+    supervisor_restart.add_argument("--state-root")
+    supervisor_restart.add_argument(
+        "--session-mode", choices=("auto", "dedicated", "adopted"), default="auto"
+    )
+    supervisor_restart.add_argument("--objective", required=True)
+    supervisor_restart.add_argument("--title")
 
     args = parser.parse_args(argv)
     if args.action == "init":
@@ -140,7 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         if not config_path.exists():
             config_path.parent.mkdir(parents=True, exist_ok=True)
             config_path.write_text(
-                "[listener]\nauto_wake = true\napp_server_response_timeout_s = 60.0\n"
+                '[codex]\nmodel = "gpt-5.6-terra"\n'
+                'approval_policy = "never"\nsandbox = "workspace-write"\n\n'
+                "# Legacy Desktop compatibility; main uses the App Server Supervisor.\n"
+                "[listener]\nauto_wake = false\napp_server_response_timeout_s = 60.0\n"
                 "bind_recency_s = 600.0\n"
                 "reconnect_initial_s = 2.0\nreconnect_max_s = 60.0\n"
                 "event_poll_s = 0.25\nevent_grace_s = 30.0\n\n"
@@ -155,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "session":
         from .research_session import ResearchSessionManager
 
-        result = ResearchSessionManager(args.project).prepare(
+        result = ResearchSessionManager(args.project, state_root=args.state_root).prepare(
             create_thread=args.create_thread,
             thread_id=args.thread_id,
             objective=args.objective,
@@ -165,11 +216,11 @@ def main(argv: list[str] | None = None) -> int:
         _print(result)
         return 0
 
-    if args.action == "start":
+    if args.action == "submit":
         from .mcp_server import ExperimentService
 
-        service = ExperimentService(args.project)
-        result = service.start_experiment(
+        service = ExperimentService(args.project, state_root=args.state_root)
+        result = service.submit_experiment(
             args.idea_id,
             args.worktree,
             args.command,
@@ -184,8 +235,9 @@ def main(argv: list[str] | None = None) -> int:
         from .ledger import read_json
         from .runner import ExperimentRunner
 
+        from .state_paths import resolve_state_root
         project = Path(args.project).resolve()
-        runner = ExperimentRunner(project / "research" / "runs")
+        runner = ExperimentRunner(resolve_state_root(project, args.state_root) / "runs")
         if args.action == "wait":
             result = runner.wait(args.run_id)
             _print(result.to_dict())
@@ -199,6 +251,79 @@ def main(argv: list[str] | None = None) -> int:
                 "result": result.to_dict() if result else None,
             }
         )
+        return 0
+
+    if args.action == "goal":
+        from .app_server import AppServerClient
+        from .ledger import read_json, write_json_atomic
+        from .research_session import read_bound_thread_id
+        from .supervisor import is_supervisor_thread, supervisor_active_experiment_path
+
+        project = Path(args.project).resolve()
+        environment_thread_id = os.environ.get("CODEX_THREAD_ID") or None
+        bound_thread_id = read_bound_thread_id(project, args.state_root)
+        requested_thread_id = args.thread_id or environment_thread_id or bound_thread_id
+        if not requested_thread_id:
+            raise ValueError("no managed Goal thread is bound to this project")
+        if environment_thread_id and requested_thread_id != environment_thread_id:
+            raise ValueError("--thread-id does not match current CODEX_THREAD_ID")
+        if not is_supervisor_thread(project, requested_thread_id, args.state_root):
+            raise ValueError("--thread-id is not this project's managed Supervisor Goal thread")
+        handoff: dict[str, object] | None = None
+        if args.status == "paused":
+            # Store the wait handoff before changing Goal state.  Supervisor
+            # polls this marker while the Goal Turn is still in progress.
+            marker_path = supervisor_active_experiment_path(project, args.state_root)
+            marker = read_json(marker_path, {}) or {}
+            if marker.get("thread_id") == requested_thread_id and isinstance(
+                marker.get("run_id"), str
+            ):
+                marker.update(
+                    {
+                        "wait_requested": True,
+                        "wait_requested_at": time.time(),
+                        "wait_requested_by": "goal_self_control",
+                    }
+                )
+                write_json_atomic(marker_path, marker)
+                handoff = {
+                    "run_id": marker["run_id"],
+                    "wait_requested": True,
+                    "owner": "supervisor",
+                }
+        request_path = (
+            supervisor_active_experiment_path(project, args.state_root).parent
+            / "goal_status_request.json"
+        )
+        request = {
+            "thread_id": requested_thread_id,
+            "status": args.status,
+            "requested_at": time.time(),
+            "requested_by": "goal_self_control",
+        }
+        try:
+            with AppServerClient(
+                project,
+                client_name="auto-research-goal-self-control",
+                client_version="0.6.0",
+                managed_daemon=True,
+                ensure_daemon=False,
+            ) as client:
+                client.initialize()
+                result = client.set_goal_status(requested_thread_id, args.status)
+            _print({**result, "experiment_handoff": handoff, "bridge": "direct"})
+        except Exception as exc:  # The Goal shell may not read daemon pid locks.
+            write_json_atomic(request_path, request)
+            _print(
+                {
+                    "threadId": requested_thread_id,
+                    "status": "PENDING_SUPERVISOR",
+                    "requested_status": args.status,
+                    "experiment_handoff": handoff,
+                    "bridge": "supervisor",
+                    "direct_error": f"{type(exc).__name__}: {exc}",
+                }
+            )
         return 0
 
     if args.action == "arm-wake":
@@ -226,8 +351,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.action == "mcp-server":
-        import os
-
         from .mcp_server import main as mcp_main
 
         os.environ["AUTO_RESEARCH_PROJECT_DIR"] = str(Path(args.project).resolve())
@@ -250,26 +373,43 @@ def main(argv: list[str] | None = None) -> int:
         from .supervisor import (
             AppServerSupervisor,
             read_supervisor_state,
+            restart_supervisor,
             spawn_supervisor,
         )
 
         if args.supervisor_action == "run":
             result = AppServerSupervisor(
-                args.project, adopt_session=args.adopt_session
+                args.project,
+                session_mode=args.session_mode,
+                state_root=args.state_root,
             ).run()
         elif args.supervisor_action == "start":
             result = spawn_supervisor(
-                args.project, adopt_session=args.adopt_session
+                args.project,
+                session_mode=args.session_mode,
+                state_root=args.state_root,
             )
         elif args.supervisor_action == "resume":
             result = AppServerSupervisor(
-                args.project, adopt_session=args.adopt_session
+                args.project,
+                session_mode=args.session_mode,
+                state_root=args.state_root,
             ).resume()
             result["supervisor"] = spawn_supervisor(
-                args.project, adopt_session=args.adopt_session
+                args.project,
+                session_mode=args.session_mode,
+                state_root=args.state_root,
+            )
+        elif args.supervisor_action == "restart":
+            result = restart_supervisor(
+                args.project,
+                objective=args.objective,
+                title=args.title,
+                session_mode=args.session_mode,
+                state_root=args.state_root,
             )
         else:
-            result = read_supervisor_state(args.project) or {"state": "NOT_STARTED"}
+            result = read_supervisor_state(args.project, args.state_root) or {"state": "NOT_STARTED"}
         _print(result)
         return 0
 
