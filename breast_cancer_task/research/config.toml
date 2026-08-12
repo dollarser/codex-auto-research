@@ -1,5 +1,11 @@
+[codex]
+model = "gpt-5.6-terra"
+approval_policy = "never"
+sandbox = "workspace-write"
+
 [listener]
-auto_wake = true
+# Legacy Desktop compatibility only; disabled for the App Server Supervisor.
+auto_wake = false
 app_server_response_timeout_s = 60.0
 bind_recency_s = 600.0
 reconnect_initial_s = 2.0

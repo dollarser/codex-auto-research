@@ -28,6 +28,7 @@ def render_mcp_config(
         f"command = {json.dumps(executable)}\n"
         'args = ["-m", "auto_research.mcp_server"]\n'
         f"env = {{ AUTO_RESEARCH_PROJECT_DIR = {json.dumps(str(project))} }}\n"
+        "required = true\n"
         "startup_timeout_sec = 20\n"
         "tool_timeout_sec = 120\n"
     )

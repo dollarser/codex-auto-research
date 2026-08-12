@@ -1,4 +1,4 @@
-"""Configuration for detached experiments and the one-shot Goal wake listener."""
+"""Configuration for the Supervisor runtime and legacy Desktop listener."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from pathlib import Path
 import tomllib
 
 DEFAULT_ALLOWED_EXECUTABLES = {"python", "python3"}
+
+
 def _env(name: str) -> str | None:
     value = os.environ.get(name)
     return value.strip() if value is not None and value.strip() else None
@@ -44,15 +46,26 @@ def _float(value: object, name: str, minimum: float = 0.0) -> float:
     return parsed
 
 
+def _string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
 @dataclass(frozen=True)
 class ResearchConfig:
+    codex_model: str = "gpt-5.6-terra"
+    codex_approval_policy: str = "never"
+    codex_sandbox: str = "workspace-write"
     app_server_response_timeout_s: float = 60.0
     bind_recency_s: float = 600.0
     reconnect_initial_s: float = 2.0
     reconnect_max_s: float = 60.0
     event_poll_s: float = 0.25
     event_grace_s: float = 30.0
-    auto_wake: bool = True
+    # Legacy Desktop Goal listener. The managed App Server Supervisor is the
+    # default runtime and does not use this compatibility path.
+    auto_wake: bool = False
     use_shell: bool = True
     allowed_executables: frozenset[str] = field(
         default_factory=lambda: frozenset(DEFAULT_ALLOWED_EXECUTABLES)
@@ -71,6 +84,7 @@ def load_config(project_dir: str | Path) -> ResearchConfig:
             file_data = tomllib.load(stream)
     listener = file_data.get("listener", {})
     experiment = file_data.get("experiment", {})
+    codex = file_data.get("codex", {})
 
     def value(section: dict, key: str, env_name: str, default: object) -> object:
         override = _env(env_name)
@@ -96,6 +110,28 @@ def load_config(project_dir: str | Path) -> ResearchConfig:
         raise ValueError("experiment.allowed_executables must not be empty")
 
     return ResearchConfig(
+        codex_model=_string(
+            value(codex, "model", "AUTO_RESEARCH_CODEX_MODEL", "gpt-5.6-terra"),
+            "codex.model",
+        ),
+        codex_approval_policy=_string(
+            value(
+                codex,
+                "approval_policy",
+                "AUTO_RESEARCH_CODEX_APPROVAL_POLICY",
+                "never",
+            ),
+            "codex.approval_policy",
+        ),
+        codex_sandbox=_string(
+            value(
+                codex,
+                "sandbox",
+                "AUTO_RESEARCH_CODEX_SANDBOX",
+                "workspace-write",
+            ),
+            "codex.sandbox",
+        ),
         app_server_response_timeout_s=_float(
             value(
                 listener,
@@ -135,7 +171,7 @@ def load_config(project_dir: str | Path) -> ResearchConfig:
             "listener.event_grace_s",
         ),
         auto_wake=_bool(
-            value(listener, "auto_wake", "AUTO_RESEARCH_AUTO_WAKE", True),
+            value(listener, "auto_wake", "AUTO_RESEARCH_AUTO_WAKE", False),
             "listener.auto_wake",
         ),
         use_shell=_bool(

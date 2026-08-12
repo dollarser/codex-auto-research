@@ -1,4 +1,4 @@
-"""One-shot bridge from a durable experiment terminal event to a Codex Goal."""
+"""Legacy Desktop-only bridge from an experiment terminal event to a Goal."""
 
 from __future__ import annotations
 
@@ -241,7 +241,6 @@ class GoalWakeListener:
             goal_status = goal.get("status")
             if goal_status in {
                 "complete",
-                "blocked",
                 "usageLimited",
                 "budgetLimited",
             }:
@@ -304,7 +303,6 @@ class GoalWakeListener:
                 raise GoalBindingError(f"thread {thread_id} no longer has a Goal")
             if goal.get("status") in {
                 "complete",
-                "blocked",
                 "usageLimited",
                 "budgetLimited",
             }:
@@ -312,6 +310,13 @@ class GoalWakeListener:
                     state="SKIPPED",
                     reason=f"Goal is {goal.get('status')}; listener will not manage it",
                     finished_at=_now(),
+                )
+            if goal.get("status") == "blocked":
+                return self._save(
+                    state="WAITING",
+                    pause_mode="blocked_wait",
+                    pause_confirmed_status="blocked",
+                    last_error=None,
                 )
 
             state = self._state()
@@ -391,9 +396,15 @@ class GoalWakeListener:
                         f"thread {thread_id} lost its Goal during pause handoff"
                     )
                 status = current.get("status")
+                if status == "blocked":
+                    return self._save(
+                        state="WAITING",
+                        pause_mode="blocked_wait",
+                        pause_confirmed_status="blocked",
+                        last_error=None,
+                    )
                 if status in {
                     "complete",
-                    "blocked",
                     "usageLimited",
                     "budgetLimited",
                 }:
@@ -511,6 +522,10 @@ def spawn_wake_listener(
 
 def recover_wake_listeners(project_dir: str | Path) -> list[dict[str, Any]]:
     project = Path(project_dir).resolve()
+    if not load_config(project).auto_wake:
+        # The Desktop listener is a legacy opt-in compatibility path. Turning
+        # it off must also prevent recovery from silently re-enabling it.
+        return []
     recovered: list[dict[str, Any]] = []
     for run_file in sorted(project.joinpath("research", "runs").glob("run-*/run.json")):
         run = read_json(run_file, {}) or {}

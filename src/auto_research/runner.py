@@ -99,6 +99,7 @@ class ExperimentRunner:
         wake_enabled: bool = False,
         codex_thread_id: str | None = None,
         pause_goal_on_turn_end: bool = False,
+        launch_worker: bool = True,
     ) -> str:
         with _terminal_lock(self.runs_dir):
             if idempotency_key:
@@ -143,45 +144,73 @@ class ExperimentRunner:
                 "worker_heartbeat_s": config.worker_heartbeat_s,
             }
             write_json_atomic(run_dir / "run.json", run)
-            worker_log = (run_dir / "worker.log").open("ab")
-            worker_cmd = [
-                sys.executable,
-                "-m",
-                "auto_research.runner_worker",
-                "--run-dir",
-                str(run_dir),
-            ]
-            process_env = os.environ.copy()
-            process_env.update(env or {})
-            # The Harness/MCP process may itself be supervised by launchd with
-            # a minimal PATH.  Put the interpreter environment that launched
-            # this runner first so `python`/`python3` in an experiment resolve
-            # to the same environment as the Worker, including its packages.
-            interpreter_bin = str(Path(sys.executable).parent)
-            current_path = process_env.get("PATH", "")
-            process_env["PATH"] = interpreter_bin + (
-                os.pathsep + current_path if current_path else ""
-            )
-            process_env["AUTO_RESEARCH_RUN_ID"] = run_id
-            process_env["AUTO_RESEARCH_RUN_DIR"] = str(run_dir)
-            process = subprocess.Popen(
-                worker_cmd,
-                cwd=str(Path(worktree).resolve()),
-                stdin=subprocess.DEVNULL,
-                stdout=worker_log,
-                stderr=subprocess.STDOUT,
-                env=process_env,
-                start_new_session=True,
-                close_fds=True,
-            )
-            worker_log.close()
-            # Reap the detached supervisor when it exits so short-lived callers do
-            # not emit ResourceWarning while the durable worker keeps running.
-            threading.Thread(target=process.wait, daemon=True).start()
-            run["worker_pid"] = process.pid
-            run["status"] = "RUNNING"
-            write_json_atomic(run_dir / "run.json", run)
+            if not launch_worker:
+                return run_id
+            self._launch_worker(run_dir, run, env)
             return run_id
+
+    def _launch_worker(
+        self,
+        run_dir: Path,
+        run: dict[str, Any],
+        env: dict[str, str] | None = None,
+    ) -> None:
+        worker_log = (run_dir / "worker.log").open("ab")
+        worker_cmd = [
+            sys.executable,
+            "-m",
+            "auto_research.runner_worker",
+            "--run-dir",
+            str(run_dir),
+        ]
+        process_env = os.environ.copy()
+        process_env.update(env or run.get("env") or {})
+        # Put the interpreter environment that launched this runner first so
+        # experiment Python commands resolve to the same package environment.
+        interpreter_bin = str(Path(sys.executable).parent)
+        current_path = process_env.get("PATH", "")
+        process_env["PATH"] = interpreter_bin + (
+            os.pathsep + current_path if current_path else ""
+        )
+        process_env["AUTO_RESEARCH_RUN_ID"] = str(run["run_id"])
+        process_env["AUTO_RESEARCH_RUN_DIR"] = str(run_dir)
+        process = subprocess.Popen(
+            worker_cmd,
+            cwd=str(Path(str(run["worktree"])).resolve()),
+            stdin=subprocess.DEVNULL,
+            stdout=worker_log,
+            stderr=subprocess.STDOUT,
+            env=process_env,
+            start_new_session=True,
+            close_fds=True,
+        )
+        worker_log.close()
+        # Reap the detached supervisor when it exits so short-lived callers do
+        # not emit ResourceWarning while the durable worker keeps running.
+        threading.Thread(target=process.wait, daemon=True).start()
+        run["worker_pid"] = process.pid
+        run["status"] = "RUNNING"
+        write_json_atomic(run_dir / "run.json", run)
+
+    def launch(self, run_id: str) -> dict[str, Any]:
+        """Launch a durably submitted run from the host-side Supervisor."""
+        run_id = _validate_run_id(run_id)
+        run_dir = self.runs_dir / run_id
+        if not run_dir.exists():
+            raise FileNotFoundError(f"Unknown run: {run_id}")
+        with _terminal_lock(self.runs_dir):
+            result = self.get_result(run_id)
+            if result is not None:
+                return self.get_run(run_id)
+            run = self.get_run(run_id)
+            if run.get("status") == "RUNNING":
+                return run
+            if run.get("status") != "SUBMITTED":
+                raise RuntimeError(
+                    f"run {run_id} cannot launch from status {run.get('status')!r}"
+                )
+            self._launch_worker(run_dir, run)
+            return self.get_run(run_id)
 
     def annotate_run(self, run_id: str, **metadata: Any) -> None:
         """Add controller provenance to a durable run without changing status."""

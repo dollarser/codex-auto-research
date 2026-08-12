@@ -1,6 +1,31 @@
 # v0.1/v0.2 历史问题与修复记录
 
-本文档记录完整 GoalHarness 在 v0.1/v0.2 中遇到的问题，供历史版本维护和 v0.3 避免回归。当前 v0.3 已删除 `GoalHarness`；现行设计见 [CODEX_AUTO_RESEARCH_AGENT_DESIGN.md](CODEX_AUTO_RESEARCH_AGENT_DESIGN.md)。
+本文档记录完整 GoalHarness 在 v0.1/v0.2 中遇到的问题。现行默认设计见
+[App Server Supervisor](AUTO_RESEARCH_SUPERVISOR_SCHEDULER_DESIGN.md)；v0.3 Listener
+仅作为 [Desktop legacy 兼容方案](LEGACY_DESKTOP_GOAL_WAKE_LISTENER.md) 保留。
+
+## 2026-08-11：MCP Worker 所有权回归
+
+- 现象：managed Goal Turn 调用公开 `start_experiment` 后，MCP/工具进程直接创建的
+  Worker 在调用生命周期结束时被宿主回收；没有 `started.json` 或 heartbeat，实验未
+  真正进入 GPU 执行。
+- 对照：同一个 run 保持 `SUBMITTED`，再由长期运行的 Supervisor 调用 Runner launch
+  后可以稳定完成。
+- 修复：删除公开 MCP `start_experiment` 和 CLI `start`；替换为纯持久化的
+  `submit_experiment` / `auto-research submit`。Codex 负责生成命令，Supervisor 是唯一
+  Worker 启动者，Goal Turn、MCP server 和普通 shell 都不得直接启动长实验。
+- 测试：提交结果必须是 `SUBMITTED`、`launch_worker=false`、
+  `worker_owner=supervisor`；非 Supervisor task 提交必须 fail closed。
+
+## 2026-08-11：订阅变化导致 Goal continuation 模型不可用
+
+- 现象：实验终态、结果注入和 Goal `active` 均成功，但新 continuation 使用全局
+  `gpt-5.6-sol` 后返回账户不支持错误，Goal 进入 `blocked`，后续实验未提交。
+- 修复：新增 `[codex].model`，默认 `gpt-5.6-terra`；Supervisor 和 session
+  bootstrap 均先调用 `model/list`，再把已验证模型显式传入 `thread/start` 和
+  `thread/resume`。
+- 状态修复：实验终态除清除 marker 外，同时将 `active_run_id` 和
+  `waiting_run_id` 置空，避免 `NEEDS_USER` 状态继续展示已完成 run。
 
 ## 固定历史状态
 
@@ -18,7 +43,9 @@
 - 放弃以 `orze`/`orze_pro` 作为运行时基础，只保留其研究循环、实验隔离和恢复思路作为参考。
 - 方案收敛为 `Codex Goal + Codex App Server + Experiment MCP + detached Worker`：Codex Goal 负责研究判断，Harness 负责生命周期，MCP 负责确定性实验操作，Worker 负责长实验。
 - 评估过 CLI、SDK 和 MCP；当前 Harness 使用 `codex app-server --stdio`，避免每轮创建独立 CLI 会话，同时保留 thread/turn/Goal 的可恢复关系。
-- 将不同历史方案拆到 `docs/HISTORY_DESIGN_ALTERNATIVES.md`，当前架构集中在 `docs/CODEX_AUTO_RESEARCH_AGENT_DESIGN.md`，并统一放入 `docs/` 目录。
+- 将不同历史方案拆到 `docs/HISTORY_DESIGN_ALTERNATIVES.md`；当前默认架构集中在
+  `docs/AUTO_RESEARCH_SUPERVISOR_SCHEDULER_DESIGN.md`，Desktop Listener 单独归档为
+  `docs/LEGACY_DESKTOP_GOAL_WAKE_LISTENER.md`。
 
 ### 目标、Goal 和硬性验收
 

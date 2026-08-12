@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from .app_server import AppServerClient
+from .config import load_config
 from .ledger import write_json_atomic
+from .state_paths import resolve_state_root
 
 SESSION_SCHEMA_VERSION = 1
 SESSION_FILE_NAME = "codex_session.json"
@@ -52,10 +54,10 @@ def _read_state(path: Path) -> dict[str, Any] | None:
     return value
 
 
-def read_bound_thread_id(project_dir: str | Path) -> str | None:
+def read_bound_thread_id(project_dir: str | Path, state_root: str | Path | None = None) -> str | None:
     """Return the project's persisted dedicated thread, failing closed on damage."""
     project = Path(project_dir).resolve()
-    state = _read_state(project / "research" / SESSION_FILE_NAME)
+    state = _read_state(resolve_state_root(project, state_root) / SESSION_FILE_NAME)
     if state is None:
         return None
     recorded_project = state.get("project_root")
@@ -77,17 +79,28 @@ class ResearchSessionManager:
         self,
         project_dir: str | Path,
         *,
+        state_file_name: str = SESSION_FILE_NAME,
+        state_root: str | Path | None = None,
         client_factory: Callable[[], Any] | None = None,
     ):
+        if Path(state_file_name).name != state_file_name:
+            raise ResearchSessionError("state_file_name must be a plain file name")
         self.project_dir = Path(project_dir).resolve()
-        self.research_dir = self.project_dir / "research"
-        self.state_path = self.research_dir / SESSION_FILE_NAME
-        self.lock_path = self.research_dir / ".codex-session.lock"
+        self.config = load_config(self.project_dir)
+        self.research_dir = resolve_state_root(self.project_dir, state_root)
+        self.state_path = self.research_dir / state_file_name
+        lock_name = (
+            ".codex-session.lock"
+            if state_file_name == SESSION_FILE_NAME
+            else f".{Path(state_file_name).stem.replace('_', '-')}.lock"
+        )
+        self.lock_path = self.research_dir / lock_name
         self.client_factory = client_factory or (
             lambda: AppServerClient(
                 self.project_dir,
                 client_name="auto-research-session-bootstrap",
-                client_version="0.3.0",
+                client_version="0.5.0",
+                managed_daemon=True,
             )
         )
 
@@ -189,7 +202,10 @@ class ResearchSessionManager:
                 client.initialize()
                 if state is None and create_thread:
                     started_thread = client.start_thread(
-                        service_name="auto-research-session-bootstrap"
+                        service_name="auto-research-session-bootstrap",
+                        model=self.config.codex_model,
+                        approval_policy=self.config.codex_approval_policy,
+                        sandbox=self.config.codex_sandbox,
                     )
                     thread_id = str(started_thread["id"])
                     created = True
@@ -203,6 +219,9 @@ class ResearchSessionManager:
                         "title": chosen_title,
                         "objective": chosen_objective,
                         "ownership": "auto_created",
+                        "model": self.config.codex_model,
+                        "approval_policy": self.config.codex_approval_policy,
+                        "sandbox": self.config.codex_sandbox,
                         "setup_state": "initializing",
                         "created_at": now,
                         "updated_at": now,
@@ -257,18 +276,23 @@ class ResearchSessionManager:
                     and isinstance(current_goal.get("objective"), str)
                     else None
                 )
+                current_goal_complete = bool(
+                    isinstance(current_goal, dict)
+                    and current_goal.get("status") == "complete"
+                )
                 requested_objective = objective
                 if (
                     requested_objective is not None
                     and current_objective is not None
                     and requested_objective != current_objective
+                    and not current_goal_complete
                     and not replace_goal
                 ):
                     raise ResearchSessionError(
                         "the dedicated thread already has a different Goal; "
                         "pass --replace-goal only after confirming the replacement"
                     )
-                if current_goal is None:
+                if current_goal is None or current_goal_complete:
                     goal_objective = (
                         requested_objective
                         or str(state.get("objective") or "").strip()
@@ -297,6 +321,9 @@ class ResearchSessionManager:
                     {
                         "title": chosen_title,
                         "objective": persisted_objective,
+                        "model": self.config.codex_model,
+                        "approval_policy": self.config.codex_approval_policy,
+                        "sandbox": self.config.codex_sandbox,
                         "setup_state": "ready",
                         "updated_at": time.time(),
                     }
@@ -311,6 +338,9 @@ class ResearchSessionManager:
                     if isinstance(current_goal, dict)
                     else None,
                     "created": created,
+                    "model": self.config.codex_model,
+                    "approval_policy": self.config.codex_approval_policy,
+                    "sandbox": self.config.codex_sandbox,
                     "reused": not created,
                     "state_file": str(self.state_path),
                 }

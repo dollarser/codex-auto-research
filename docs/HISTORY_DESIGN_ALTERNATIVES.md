@@ -1,6 +1,8 @@
 # 自动实验优化 Agent 历史方案
 
-本文档保存已经讨论过、但不属于当前默认运行链路的设计。当前方案请阅读 [CODEX_AUTO_RESEARCH_AGENT_DESIGN.md](CODEX_AUTO_RESEARCH_AGENT_DESIGN.md)。
+本文档保存已经讨论过、但不属于当前默认运行链路的设计。当前默认方案请阅读
+[App Server Supervisor](AUTO_RESEARCH_SUPERVISOR_SCHEDULER_DESIGN.md)。Desktop Listener
+的历史实现单独见 [Legacy Desktop Listener](LEGACY_DESKTOP_GOAL_WAKE_LISTENER.md)。
 
 ## 1. Python Director + Codex SDK
 
@@ -56,6 +58,7 @@ flowchart LR
 | B | Agents SDK Director | Codex MCP Server + Runner | 仅保留设计记录，未作为当前实现 |
 | C | Harness 与 Codex 分担 | Experiment MCP + detached Worker + 完整 GoalHarness | v0.1，tag `v0.1.0` |
 | D | Codex Goal | Experiment MCP + detached Worker + 完整 GoalHarness | v0.2，tag `v0.2.0` |
-| E | Codex Goal | CLI/可选 MCP + detached Worker + one-shot Listener | v0.3 当前默认方案 |
+| E | Codex Goal | CLI/可选 MCP + detached Worker + one-shot Listener | v0.3 legacy，默认禁用 |
 
-更完整的职责矩阵和长实验等待方式对比见[当前方案设计的“与历史架构方案对比”](CODEX_AUTO_RESEARCH_AGENT_DESIGN.md#11-与历史架构方案对比)。
+更完整的历史职责矩阵和长实验等待方式对比见
+[Legacy Desktop Listener 的方案对比](LEGACY_DESKTOP_GOAL_WAKE_LISTENER.md#11-与历史架构方案对比)。
