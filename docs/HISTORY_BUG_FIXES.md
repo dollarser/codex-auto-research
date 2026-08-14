@@ -1,8 +1,72 @@
 # v0.1/v0.2 历史问题与修复记录
 
 本文档记录完整 GoalHarness 在 v0.1/v0.2 中遇到的问题。现行默认设计见
-[App Server Supervisor](AUTO_RESEARCH_SUPERVISOR_SCHEDULER_DESIGN.md)；v0.3 Listener
-仅作为 [Desktop legacy 兼容方案](LEGACY_DESKTOP_GOAL_WAKE_LISTENER.md) 保留。
+[App Server Supervisor](AUTO_RESEARCH_SUPERVISOR_SCHEDULER_DESIGN.md)。旧 Listener 已从
+代码、CLI、配置和测试中删除，只在本文保留必要的历史原因。
+
+## 2026-08-14：最小控制状态、paused/blocked 规则与运行安全
+
+- `state.json` 从运行阶段集合收敛为 `OPEN / NEEDS_USER / COMPLETED`；Goal、Turn、Worker
+  和交付进度分别读取 App Server、run events 与 registry 事实。
+- 终态先尽力注入轻量通知；paused Goal 随后无条件激活，blocked Goal 永不自动恢复。
+  多个同时终态只激活一次，通知失败不阻断恢复。
+- Supervisor 启动增加 launch lock、PID start-time 身份和 `OPERATIONAL` 门槛；顶层异常
+  持久化并尽力创建 repair Turn。提交已落盘后启动失败返回同一个 run id 与
+  `REPAIR_PENDING`。
+- Runner 对 `run.json` 统一使用 per-run read-modify-write，避免 worker/child PID 覆盖；
+  cancel 校验进程身份并确认退出后再提交终态。registry 损坏改为失败关闭。
+- session runtime 只验证现有 binding；新 Goal cycle 只能显式 restart。Thread 创建使用稳定
+  creation key，run 固化 `goal_cycle_id`，Goal 状态桥改成按 request id 的队列。
+
+## 2026-08-14：设计原则审查后的永久停滞修复
+
+- `NEEDS_USER` 现在只停止没有新终态依据的 Goal 自动推进，不再阻止 durable run 启动、
+  监控、终态注入和清理；终态仍按实时 paused Goal 规则尝试一次唤醒。
+- Worker watchdog 同时使用 PID start ticks、deadline 和 heartbeat。alive Worker 超过
+  deadline 后先核验并终止 child/Worker，成功才提交 `TIMEOUT`。
+- Goal Turn 增加默认 1800 秒的可配置无进展上限；快照变化会刷新期限。普通 Turn 卡死后
+  只创建一次 repair Turn，repair 再卡死进入 `NEEDS_USER`。进程级 repair 等待也持续
+  reconciliation runs；repair 失败时已有实验继续监控到终态，终态创建的 repair Turn
+  重新接入 watchdog。
+- 删除 `wait_requested` 对 Goal 的推测控制、旧 `wake.json` 展示字段、未调用 foreign wait、
+  shell allowlist、七天 timeout 上限和未使用的 `GoalSpec`。同步只读
+  `auto-research wait` 保留，不构成第二套 Goal control plane。
+
+## 2026-08-14：终态唤醒竞态、死亡 Supervisor 与系统级串行限制
+
+- 现象：实验完成后 native activation 已经创建 continuation，但紧随其后的 Goal 读取
+  仍返回旧 `paused`；Supervisor 因而以 `GOAL_PAUSED` 退出。新 Turn 随后提交的 run
+  只留下 `SUBMITTED`，因为没有 Supervisor 启动 Worker。
+- 根因：单一 `active_experiment.json` 同时承担并发锁、等待交接和终态所有权；终态
+  路径先删 marker，再激活 Goal，并把一次即时 Goal 读取误当作 continuation 证据。
+  `process.json` 还可能在进程退出后残留。
+- 修复：活动运行改为 `active_experiments.json` 的按 `run_id` 注册表；Supervisor 不实施
+  实验数量限制。终态先注入并记录交付进度，再激活；只有交付和 wake/repair 被接受后
+  才删除对应 entry。激活后的成功证据是新 `turn/started`，旧 `paused` 读取不再导致
+  退出。`submit` 会验证 PID 和 READY，Supervisor 不存在时自动启动；子进程退出时清理
+  自己的 `process.json`。
+- MCP 边界：保留无需人工授权的查询和取消；二者都不能删除 registry entry 或修改
+  Goal。暂停的唯一入口仍是 `auto-research goal set-status paused`，并作用于该 Task
+  当前所有 active runs。
+- 验证：覆盖多个 active run、查询/取消不消费终态、旧 paused 读取下的真实
+  continuation，以及多 run pause handoff。
+
+## 2026-08-13：blocked Goal 被 Supervisor 反复激活并空转
+
+- 现象：Agent 经过严格审计真实调用 `update_goal(blocked)` 后，Supervisor 每隔数秒又
+  将同一 Goal 设为 `active`。原生 scheduler 随即创建新 Turn；Agent 根据刚才的真实
+  历史只回复“Goal 仍为 blocked”，形成无工具调用、无实验提交的无限 continuation。
+- 根因：`_after_goal_turn()` 和 bootstrap 把所有非 `active` 状态统一送入激活/repair
+  路径，混淆了“Agent 的终态决定”和“实验终态后的必要唤醒”。测试也把启动时自动
+  激活 blocked Goal 当作正确行为，因而没有覆盖该循环。
+- 当时修复：无活动实验时尊重 `blocked` 和已有控制器的 `paused`，停止创建 Turn；已有
+  Worker 即使 Goal 停止仍监控到终态。后续最小状态设计已删除 `GOAL_BLOCKED`、
+  `GOAL_PAUSED` 本地副本：现在实时 Goal 是唯一事实源，终态只激活 `paused`，`blocked`
+  永不自动恢复。
+- 防误判：Goal 提示词明确“缺少 WCS/标注平台访问本身不是 blocker”，只要本地固定
+  快照、实验产物或未验证方法仍可推进就必须继续。
+- 验证：新增 bootstrap blocked、Turn 后 blocked、Turn 后 paused、已有 paused 重启、
+  实验终态 blocked 唤醒和 repair 拒绝测试，并运行完整 pytest。
 
 ## 2026-08-11：MCP Worker 所有权回归
 
@@ -43,9 +107,8 @@
 - 放弃以 `orze`/`orze_pro` 作为运行时基础，只保留其研究循环、实验隔离和恢复思路作为参考。
 - 方案收敛为 `Codex Goal + Codex App Server + Experiment MCP + detached Worker`：Codex Goal 负责研究判断，Harness 负责生命周期，MCP 负责确定性实验操作，Worker 负责长实验。
 - 评估过 CLI、SDK 和 MCP；当前 Harness 使用 `codex app-server --stdio`，避免每轮创建独立 CLI 会话，同时保留 thread/turn/Goal 的可恢复关系。
-- 将不同历史方案拆到 `docs/HISTORY_DESIGN_ALTERNATIVES.md`；当前默认架构集中在
-  `docs/AUTO_RESEARCH_SUPERVISOR_SCHEDULER_DESIGN.md`，Desktop Listener 单独归档为
-  `docs/LEGACY_DESKTOP_GOAL_WAKE_LISTENER.md`。
+- 将不同历史方案拆到 `docs/HISTORY_DESIGN_ALTERNATIVES.md`；当前架构只在
+  `docs/AUTO_RESEARCH_SUPERVISOR_SCHEDULER_DESIGN.md` 定义。
 
 ### 目标、Goal 和硬性验收
 
@@ -127,7 +190,7 @@ Goal/App Server 可以在一个长生命周期内继续产生多个实际 turn�
 
 ### 6. MCP active marker 损坏或进程中途退出
 
-`active_experiment.json` 被截断时原来可能让 MCP 服务失效。现在 marker 只作为恢复提示，损坏时删除；真实状态以 `run.json` 和终态事件为准，并扫描 `SUBMITTED/RUNNING` run 恢复活动实验。提交和终态写入使用文件锁与原子 JSON。
+`active_experiment.json` 被截断时原来可能让 MCP 服务失效。当时的修复把 marker 作为恢复提示，损坏时删除，并扫描 `SUBMITTED/RUNNING` run 恢复活动实验；该单 marker 方案已被 2026-08-14 的多-run registry 取代。
 
 ### 7. Worker 与终端/Harness 生命周期耦合
 
@@ -217,6 +280,21 @@ Worker 现在 detached、独立 session、保存 PID/heartbeat；终端、App Se
 
 验证：`test_app_server_reads_thread_and_goal_state_from_api`、`test_goal_harness_reconciles_and_interrupts_orphaned_turn`、`test_recovered_turn_remains_active_when_first_interrupt_fails`、`test_goal_harness_reconfirms_pause_before_waiting_for_resumed_run`、`test_complete_goal_without_valid_decision_gets_repair_turn`。
 
+### 21. 任意 state root 造成同一 Thread 多套控制状态
+
+问题：调用方可以通过 `--state-root` 自由选择 session、Supervisor、run registry 和
+Worker 目录。同一 App Server Thread 因而可能被绑定到多个目录；Goal 内提示词若保留
+旧目录，暂停、终态注入和重启还会各自读取不同事实源。
+
+修复：状态目录唯一映射为 `research/supervisors/<thread-id>/`。Goal Turn 只使用
+`CODEX_THREAD_ID`，task 外运维显式传 `--thread-id`；删除所有 `--state-root` 和历史
+session mode。首次 `thread/start` 返回后立即原子写入 `supervisor_session.json`、
+`metadata.json` 与 cycle；同一 Thread 的下一轮 Goal 只新增 cycle，复用 runs。进程生命周期
+拆到 `supervisor_process.py`，Supervisor 状态机保持单一职责。
+
+验证：覆盖新建、adopt、同 Thread 多 cycle、completed restart、重复 start、损坏绑定、
+并发 bootstrap、外部 Thread 运维和 CLI 拒绝 `--state-root`；完整测试集 68 项通过。
+
 ## 验证标准
 
 ```bash
@@ -244,3 +322,24 @@ ps -axo pid,etime,command | rg 'goal-harness|app-server|auto_research.mcp' || tr
 问题：完全禁止当前版本创建 thread 可以杜绝历史重复会话，却要求用户先手动建 task、查找 thread id 并完成绑定；如果简单恢复 `thread/start`，重试、并发启动或初始化中途失败又可能重新制造多个空 Goal task。
 
 修复：新增独立 Session Bootstrap 和 `auto-research session`。只有显式 `--create-thread` 才允许缺失时创建；`research/codex_session.json` 与文件锁保证重复调用和并发调用复用同一 thread。取得 thread id 后先持久化，再命名和初始化 paused Goal。已有 task 可由 `--thread-id` 采用；状态损坏、项目 cwd 不符、当前 task 与专用 task 不一致时均失败关闭。Listener 仍不调用 `thread/start` 或 `turn/start`。
+
+### 22. 终态注入、Worker ownership 与人工额度恢复不收敛
+
+问题：把 Thread 注入当成必须成功的结果交付，会在完整终态已经持久化时不必要地停止
+研究。Supervisor 在 registry 提交中断后也可能漏掉已经 durable 的 `SUBMITTED/RUNNING` run。
+取消、超时和 LOST 路径若在无法确认进程退出时仍写终态，会释放仍存活 Worker/child 的
+ownership。额度限制恢复还曾依赖旧 marker，导致结果已注入但 marker 清除后无法继续。
+
+修复：Thread 中只尽力注入 `run_id/status/result_dir`，失败写诊断文件但继续 Goal 恢复；
+完整结果由 Codex 主动读取 run 目录。启动时从 Thread root 扫描 unfinished run 并补回
+registry。只有 PID 与 start ticks 证明 Worker 已死或 PID 已复用，且 child
+清理成功时才提交 LOST；身份不可核验、元数据损坏或清理失败均 fail closed。结果成功注入
+后 marker 可以清除；额度恢复由用户手动 `supervisor start/resume` 发起一次实时 Goal
+激活，实时状态仍是 paused 时同样适用，失败即回到 `NEEDS_USER`，不自动循环。第二个
+Supervisor 进程拿不到 scheduler lock 时只返回 `ALREADY_OWNED`，不得改写唯一 owner 的
+共享状态或创建 repair Turn。
+
+验证：覆盖轻量通知字段、通知失败后继续唤醒、批量部分失败、手动 limited/paused 单次恢复、orphan
+SUBMITTED 接管、dead Worker LOST、不可核验 Worker、取消清理失败和重复进程旁路；当前
+测试集在删除 11 条 legacy Listener 兼容测试后为 88 项。真实旁路 smoke test 同时确认
+拒绝前后 `state.json` 哈希不变。

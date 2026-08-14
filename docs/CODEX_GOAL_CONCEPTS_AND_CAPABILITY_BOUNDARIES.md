@@ -75,7 +75,7 @@ Goal status 持久化在共享 state DB；Goal runtime 的 idle check、active t
 | `thread/read` | 读取持久历史 | 不加载或调度 |
 | `thread/goal/set(active)` | 更新持久 Goal | 同 daemon 内调用 `continue_if_idle()` |
 | `thread/goal/set(paused)` | 更新持久 Goal | 清除 active accounting，停止后续 continuation |
-| `turn/start` | 创建普通用户 Turn | 新方案 Supervisor 禁止调用 |
+| `turn/start` | 创建普通用户 Turn | 正常 continuation 禁止调用；仅 native 激活失败后的可审计 repair fallback 使用 |
 | `thread/inject_items` | 追加后续模型可见历史 | 不单独启动 Turn |
 | `turn/steer` | 给当前普通 Turn追加输入 | 不唤醒 idle Thread |
 
@@ -86,7 +86,13 @@ Goal status 持久化在共享 state DB；Goal runtime 的 idle check、active t
 
 模型侧 `update_goal(blocked)` 与 App Server 客户端
 `thread/goal/set(paused)` 不是同一控制语义。实验工具通过 daemon WebSocket 设置
-paused，不要求正在运行的模型拥有 resume 工具。
+paused，不要求正在运行的模型原生拥有 Goal pause/resume 工具。Codex 所谓“自主暂停”是
+自主决定后调用 Auto Research 的状态桥，最终由该桥执行 `thread/goal/set(paused)`。
+
+同步等待实验结果与修改 Goal 是两个正交维度。`auto-research wait` 可以阻塞调用方直到
+durable terminal event，但不写 Goal、不启动 Worker，也不承担终态唤醒 ownership；因此
+它不是第二套 Goal 控制面。长实验仍优先使用 paused→active 交接，短时同步等待和人工诊断
+可以使用阻塞观察入口。
 
 ## 7. Desktop 与 daemon 隔离
 
@@ -96,7 +102,11 @@ paused，不要求正在运行的模型拥有 resume 工具。
 - `codex_app__send_message_to_thread`；
 - `/goal pause` 或 `/goal resume` 文本；
 - Desktop UI reflected/effective state；
-- Supervisor主动生成普通 Turn。
+- Supervisor 用普通 Turn 代替正常 Goal continuation。
+
+唯一例外是实验终态已经注入、`paused → active` 已请求但 native continuation 未出现时，
+Supervisor 可以创建一次带明确 run id 和错误原因的 repair Turn。它是故障上报，不是
+正常调度路径，也不得用于恢复 `blocked` Goal。
 
 专用研究 Thread 不应同时由 Desktop 的独立 App Server host恢复。需要观察时读取
 持久记录或连接 managed daemon，而不是让另一个 host取得 writer。

@@ -3,13 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
 
 from .ledger import read_json, write_json_atomic
+from .process_identity import process_start_ticks, terminate_process_group
 from .runner import TERMINAL_EVENT_NAMES, _terminal_lock, finalize_run
 
 
@@ -85,7 +85,14 @@ def main() -> int:
                 shell=bool(run.get("shell", True)),
                 stdout=stdout_file,
                 stderr=stderr_file,
-                env={**os.environ, **(run.get("env") or {})},
+                env={
+                    **os.environ,
+                    **(
+                        read_json(run_dir / "environment.json", {})
+                        or run.get("env")
+                        or {}
+                    ),
+                },
                 start_new_session=True,
             )
         except OSError as exc:
@@ -99,14 +106,22 @@ def main() -> int:
                 "error": f"could not start experiment: {exc}",
                 "finished_at": time.time(),
             }
-            write_json_atomic(run_dir / "run.json", {**run, "status": "FAILED"})
+            latest = read_json(run_dir / "run.json", {}) or run
+            write_json_atomic(run_dir / "run.json", {**latest, "status": "FAILED"})
             write_json_atomic(run_dir / "events" / "failed.json", event)
             return 1
         finally:
             stdout_file.close()
             stderr_file.close()
+        latest = read_json(run_dir / "run.json", {}) or run
         write_json_atomic(
-            run_dir / "run.json", {**run, "child_pid": child.pid, "status": "RUNNING"}
+            run_dir / "run.json",
+            {
+                **latest,
+                "child_pid": child.pid,
+                "child_pid_start_ticks": process_start_ticks(child.pid),
+                "status": "RUNNING",
+            },
         )
     try:
         return_code = child.wait(timeout=timeout_s)
@@ -114,6 +129,7 @@ def main() -> int:
             status = "COMPLETED"
             event_name = "completed.json"
             error = ""
+            validation_errors: list[str] = []
             try:
                 metrics = json.loads(
                     (run_dir / "metrics.json").read_text(encoding="utf-8")
@@ -123,9 +139,26 @@ def main() -> int:
                         "metrics.json must contain a non-empty JSON object"
                     )
             except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
-                status = "FAILED"
-                event_name = "failed.json"
-                error = f"invalid experiment result: {exc}"
+                validation_errors.append(f"invalid metrics.json: {exc}")
+            missing_artifacts: list[str] = []
+            for value in run.get("expected_artifacts") or []:
+                candidate = Path(value)
+                if not candidate.is_absolute():
+                    candidate = Path(worktree) / candidate
+                if not candidate.exists():
+                    missing_artifacts.append(str(value))
+            if missing_artifacts:
+                validation_errors.append(
+                    "missing expected artifacts: " + ", ".join(missing_artifacts)
+                )
+            write_json_atomic(
+                run_dir / "artifact_validation.json",
+                {
+                    "valid": not validation_errors,
+                    "errors": validation_errors,
+                    "checked_at": time.time(),
+                },
+            )
         else:
             status = "FAILED"
             event_name = "failed.json"
@@ -134,23 +167,18 @@ def main() -> int:
         status = "TIMEOUT"
         event_name = "timeout.json"
         error = f"experiment exceeded {timeout_s}s"
-        cleanup_errors: list[str] = []
-        try:
-            os.killpg(child.pid, signal.SIGTERM)
-            child.wait(timeout=10)
-        except (
-            ProcessLookupError,
-            PermissionError,
-            subprocess.TimeoutExpired,
-            OSError,
-        ) as exc:
-            cleanup_errors.append(f"SIGTERM cleanup failed: {exc}")
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError) as kill_exc:
-                cleanup_errors.append(f"SIGKILL cleanup failed: {kill_exc}")
-        if cleanup_errors:
-            error += "; " + "; ".join(cleanup_errors)
+        child_start_ticks = process_start_ticks(child.pid)
+        if not terminate_process_group(child.pid, child_start_ticks):
+            heartbeat_stop.set()
+            write_json_atomic(
+                run_dir / "timeout.cleanup_error.json",
+                {
+                    "run_id": run_id,
+                    "error": "timeout cleanup could not confirm child process exit",
+                    "failed_at": time.time(),
+                },
+            )
+            return 1
         return_code = None
 
     heartbeat_stop.set()

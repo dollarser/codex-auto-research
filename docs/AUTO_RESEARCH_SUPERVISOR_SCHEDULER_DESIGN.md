@@ -1,13 +1,21 @@
 # Native App Server Goal Runtime + Experiment Supervisor
 
+本文描述具体架构与流程。所有状态、恢复、错误处理和测试设计必须遵守
+[Auto Research 设计原则](DESIGN_PRINCIPLES.md)；若具体实现与设计原则冲突，以设计原则为准。
+
 ## 1. 目标与结论
+
+项目根目录的 `GOAL.md` 是 Goal objective 的唯一事实源。首次建立绑定时读取全文；
+后续实验在 `run.json` 中只保留其内容摘要用于审计。旧 `goal.json` 和
+`research/goal_contract.json` 不参与原生 Goal 或 Supervisor 控制流。
 
 本方案让 Codex 原生 Goal 持续负责研究，Supervisor 只解决长实验的等待与恢复：
 
 1. App Server Goal runtime 自动创建 Goal continuation。
 2. Goal Turn 启动实验后保持 active，允许继续产生有价值的 continuation。
 3. 只有 Agent 明确声明“只剩等待”时才切换为 `paused`；Supervisor 等本地终态。
-4. 终态后 Supervisor 设置 `active`，Goal runtime 自动创建下一 Turn。
+4. 终态后 Supervisor 尽力注入轻量通知；无论注入是否成功，实时 Goal 为 `paused` 时都
+   设置 `active`，`blocked` 保持不变。Codex 从 durable run 目录主动读取完整结果。
 5. 完全不依赖 Desktop scheduler 或 Desktop host 私有工具。
 
 当前 Codex 的 Goal runtime 在外部 Goal 更新为 `active` 时执行
@@ -24,7 +32,8 @@ Thread 时也会恢复 active Goal 的 accounting 并触发 idle lifecycle。该
 | App Server 线程、Turn 与通知协议 | [Codex App Server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md) | [`app_server.py`](../src/auto_research/app_server.py) 的 WebSocket client 与精确 Turn 等待 |
 | 原生 Goal continuation 的当前实现 | [Goal runtime source](https://github.com/openai/codex/blob/main/codex-rs/ext/goal/src/runtime.rs) | `thread/goal/set(active)` 后等待 `turn/started`；不把源码行为当公开稳定承诺 |
 | 多 runtime/同一 Thread 的风险 | [Codex issue #32793](https://github.com/openai/codex/issues/32793) | managed daemon 单实例、Supervisor lock、独立 supervisor Thread |
-| recoverable Goal 状态的本地策略 | [`supervisor.py`](../src/auto_research/supervisor.py) | [`test_supervisor.py`](../tests/test_supervisor.py)：blocked 唤醒、native timeout repair、repair 拒绝才 NEEDS_USER |
+| recoverable Goal 状态的本地策略 | [`supervisor.py`](../src/auto_research/supervisor.py) | [`test_supervisor.py`](../tests/test_supervisor.py)：自主 blocked/paused 保持、实验终态唤醒、native timeout repair、repair 拒绝才 NEEDS_USER |
+| Thread 根目录与 detached 进程生命周期 | [`state_paths.py`](../src/auto_research/state_paths.py)、[`supervisor_process.py`](../src/auto_research/supervisor_process.py) | [`test_thread_state.py`](../tests/test_thread_state.py)：唯一根目录、cycle、并发与损坏绑定 |
 
 链接的职责不同：OpenAI Developers 页面说明产品用途；App Server README 和 Goal runtime
 源码说明当前协议/实现；本项目测试才是本方案回归保证。上游实现升级时，必须重新跑
@@ -38,7 +47,7 @@ flowchart TD
     GOAL["persisted native Goal"]
     TURN["automatic Goal continuation Turn"]
     CLI["auto-research submit CLI"]
-    MCP["Experiment MCP (read/wait only)"]
+    MCP["Experiment MCP (query/cancel; no Goal control)"]
     WORKER["detached Worker"]
     EVENT["terminal event"]
     MONITOR["Supervisor monitor"]
@@ -47,10 +56,12 @@ flowchart TD
     DAEMON --> TURN
     TURN --> CLI
     CLI -->|"durable SUBMITTED run"| MONITOR
-    TURN -->|"explicit wait handoff"| MCP
-    MCP -->|"pause only when useful work is exhausted"| GOAL
+    TURN -->|"query or cancel"| MCP
+    TURN -->|"goal set-status paused"| CLI
+    CLI -->|"pause only when useful work is exhausted"| GOAL
     MONITOR --> WORKER --> EVENT
-    MONITOR -->|"inject evidence + active"| GOAL
+    MONITOR -->|"best-effort compact terminal notice"| GOAL
+    MONITOR -->|"active only when live state is paused"| GOAL
 ```
 
 | 所有权 | Owner |
@@ -78,61 +89,44 @@ App Server 进程内状态。多个独立 App Server 进程共享同一个 `CODE
 - 同一 Goal 的 session bootstrap、Supervisor 和实验暂停控制全部连接该 daemon。
 - 禁止为该 Thread 启动另一个独立 `codex app-server --stdio`。
 
-Supervisor 默认使用 `session-mode=auto`。同一 state root 只有
-`codex_session.json` 时复用该 Thread，只有 `supervisor_session.json` 时复用独立
-Supervisor Thread，两者都不存在时创建后者。若两个绑定同时存在且没有 controller
-持久模式，启动必须失败，不能静默选择或创建新 Thread。只有修复历史歧义目录时才使用
-`--session-mode adopted|dedicated`；模式一旦写入 controller state，后续
-`start/resume/restart` 自动沿用。
+Supervisor 的状态身份只有 Thread ID。所有组件使用同一个解析器把它映射为
+`research/supervisors/<thread-id>/`；不接受任意 `--state-root`，也不扫描其他目录猜测
+Thread。Goal Turn 使用 `CODEX_THREAD_ID`，task 外运维显式传 `--thread-id`。
 
 ### 3.1 Supervisor 会话选择机制
 
-Thread 选择本质上只有两种动作：
+Thread 选择只有两种动作：
 
-1. **新建 Thread**：state root 没有可复用绑定时，通过 App Server
-   `thread/start` 创建并持久化；
-2. **复用已有 Thread**：读取绑定文件中的精确 `thread_id`。复用当前桌面会话、
-   历史会话或刚由 `session --create-thread` 创建的会话，底层都属于这一类。
+1. **新建 Thread**：`session --create-thread` 调用 App Server `thread/start`，取得 ID
+   后立即创建 canonical root，并原子写入 session binding；
+2. **复用已有 Thread**：`session --thread-id` 验证 Thread 的 cwd 后，在该 Thread 的
+   canonical root 写入绑定。
 
-`dedicated` 和 `adopted` 不是不同种类的 App Server Thread，只表示绑定来源：
+Supervisor 不按标题、最近活跃时间、Goal 文本、当前桌面焦点或目录内容搜索 Thread。
+`supervisor start` 必须得到 `--thread-id`（或运行在带 `CODEX_THREAD_ID` 的 task 内），
+这样重复启动始终命中同一个进程锁，不会因丢失启动输出而创建第二个 Thread。
 
-| 有效模式 | 绑定文件 | Thread 由谁选择 |
-|---|---|---|
-| `dedicated` | `<state-root>/supervisor_session.json` | Supervisor 在没有绑定时创建，之后严格复用 |
-| `adopted` | `<state-root>/codex_session.json` | 操作者先通过 `session --create-thread` 或 `session --thread-id` 选择，Supervisor 接管 |
-| `auto` | 不新增绑定文件 | 解析策略，最终必须收敛为 `dedicated` 或 `adopted` |
-
-Supervisor 不会按标题、最近活跃时间、Goal 文本、当前桌面焦点或其他 state root
-搜索 Thread。实际选择范围严格限定在本次 `--state-root` 内。
-
-`auto` 的解析顺序为：
-
-1. `<state-root>/supervisor/state.json` 已记录有效 `session_mode`：沿用该模式，并
-   校验对应绑定仍存在；
-2. 只有 `codex_session.json`：选择 `adopted`；
-3. 只有 `supervisor_session.json`：选择 `dedicated`；
-4. 两者都不存在：选择 `dedicated`，首次启动时创建新 Thread；
-5. 两者同时存在且 controller 没有持久模式：拒绝启动，禁止猜测或创建第三个
-   Thread。
-
-同一 state root 的并发 bootstrap 通过文件锁串行化；绑定文件损坏、项目根不匹配、
-初始化未完成或缺少有效 `thread_id` 时也必须失败关闭，不能静默生成替代 Thread。
-因此相同 state root 后续总是复用同一 Thread，而新的 state root 才代表新的独立研究
-命名空间。
+首次创建要求调用方提供稳定 `--creation-key`，并由
+`research/supervisors/.thread-bootstrap.lock` 串行化。每个 key 在
+`thread_creations/` 记录 `CREATING/READY`；独立 CLI 重试复用 READY 结果，未完成记录
+失败关闭，避免因 RPC 响应丢失创建静默副本。获得 Thread ID 后，
+session、`metadata.json` 和首个 cycle 都写入 `research/supervisors/<thread-id>/`；后续
+锁、Supervisor state、run registry 和 Worker artifacts 全部留在这个根目录。绑定损坏、
+项目根不匹配、初始化未完成、目录名与内部 `thread_id` 不一致时失败关闭。
 
 新建一个由操作者预先定义标题和 Goal 的研究会话：
 
 ```bash
 uv run auto-research session \
   --project /path/to/project \
-  --state-root research/supervisors/run-a \
   --create-thread \
+  --creation-key <stable-request-id> \
   --title "Auto Research · run-a" \
   --objective "..."
 
 uv run auto-research supervisor start \
   --project /path/to/project \
-  --state-root research/supervisors/run-a
+  --thread-id <上一条输出的-thread-id>
 ```
 
 复用任意已知 Thread（包括当前桌面 Thread）：
@@ -140,36 +134,17 @@ uv run auto-research supervisor start \
 ```bash
 uv run auto-research session \
   --project /path/to/project \
-  --state-root research/supervisors/run-a \
   --thread-id <existing-thread-id> \
   --objective "..."
-```
-
-不预先选择 Thread、直接让 Supervisor 创建 dedicated 会话：
-
-```bash
 uv run auto-research supervisor start \
   --project /path/to/project \
-  --state-root research/supervisors/run-a
+  --thread-id <existing-thread-id>
 ```
-
-“两个绑定都有但没有持久模式”通常来自旧版混用两套启动流程、同一 state root 曾在
-两种模式间切换、只恢复了部分文件、手动复制状态，或删除 `supervisor/` 后保留两个
-session 文件。此时先核对两个文件中的 `thread_id`，再明确选择一次：
-
-```bash
-uv run auto-research supervisor start ... --session-mode adopted
-# 或
-uv run auto-research supervisor start ... --session-mode dedicated
-```
-
-成功启动后模式写入 `supervisor/state.json`，以后恢复默认 `auto` 即可。不要通过删除
-不确定归属的绑定文件来消除歧义；需要清理时应先保留审计副本并确认目标 Thread。
 
 当该 Thread 的 Goal 已完成时，普通 `supervisor start` 保持控制器终态，绝不隐式重建
 或重放旧 Goal。若希望保留同一 Thread 的上下文但开启下一轮研究，使用
-`supervisor restart --objective "..."`：它复用 session binding、显式替换 Goal，并创建
-新的 Supervisor 生命周期。
+`supervisor restart --thread-id <id> --objective "..."`：它复用根目录、session binding
+和历史 runs，显式替换 Goal，并在 `cycles/` 写入新的 cycle 记录。
 
 多个 WebSocket connection 是同一进程内的多个订阅者，不等于多个 Goal
 scheduler。`codex app-server proxy` 透传的是 WebSocket 字节流，不接收 App Server
@@ -189,7 +164,7 @@ Codex App Server daemon
 ├── thread/goal/set(active | paused)
 └── Unix WebSocket
     ├── Supervisor
-    ├── Goal Turn 中的 Experiment MCP（仅查询/等待）
+    ├── Goal Turn 中的 Experiment MCP（查询/取消，不控制 Goal）
     └── session bootstrap 客户端
 ```
 
@@ -214,7 +189,7 @@ Codex App Server daemon
 - [Codex developer commands: codex remote-control](https://learn.chatgpt.com/docs/developer-commands#codex-remote-control)
 - [Import in Codex CLI](https://learn.chatgpt.com/docs/import#import-in-codex-cli)
 
-### 3.2 在 Desktop 中打开 Supervisor 专用会话
+### 3.3 在 Desktop 中打开 Supervisor 专用会话
 
 Supervisor 创建的 Thread 使用普通 Codex 持久化记录，因此出现在 Desktop 侧边栏是
 正常现象。**仅在侧边栏看到它不会影响 Supervisor。**
@@ -233,7 +208,8 @@ Supervisor 创建的 Thread 使用普通 Codex 持久化记录，因此出现在
 
 1. 可以在侧边栏看到专用会话，但不要点击进入。
 2. 不要在该会话中发消息，也不要操作 Goal、停止按钮或重试按钮。
-3. 通过 `research/supervisor/state.json`、run 终态文件和 Supervisor CLI 查看进度。
+3. 通过 `research/supervisors/<thread-id>/supervisor/state.json`、run 终态文件和
+   Supervisor CLI 查看进度。
 4. campaign 完成、Supervisor 进入 `COMPLETED` 并退出后，再从 Desktop 打开会话查看。
 
 当前实现没有阻止 Desktop 打开该 Thread 的宿主级互斥机制，因此这是一条运行安全
@@ -257,8 +233,8 @@ sequenceDiagram
     D->>G: continue_if_idle
     G->>C: automatic Goal continuation
     C->>X: submit(command)
-    X-->>S: durable SUBMITTED run
-    S->>W: launch detached Worker
+    X-->>S: one or more durable SUBMITTED runs
+    S->>W: launch each detached Worker
     X-->>C: run_id + continuation_allowed
     C-->>D: turn/completed
     D->>G: continue_if_idle
@@ -269,37 +245,62 @@ sequenceDiagram
     Note over D,G: Goal paused only after useful work is exhausted
     W-->>S: durable terminal event
     S->>D: thread/inject_items(result)
-    S->>D: thread/goal/set(active)
-    D->>G: continue_if_idle
-    G->>C: automatic Goal continuation
+    S->>D: thread/goal/read (authoritative live state)
+    alt Goal is paused
+        S->>D: thread/goal/set(active)
+        D->>G: continue_if_idle
+        G->>C: automatic Goal continuation
+    else Goal is blocked
+        Note over S,G: keep blocked; never auto-recover
+    else Goal is active
+        Note over S,G: evidence delivered; no status write
+    else Goal is complete or limited/unknown
+        Note over S,G: complete controller or enter NEEDS_USER
+    end
 ```
 
-显式等待交接由 Goal 自己执行 `auto-research goal set-status paused` 完成；该 CLI 仅允许修改项目绑定的自身 Thread，直接调用 App Server `thread/goal/set`，不经过 MCP 审批。启动实验本身不触发交接。Agent 可以经历任意多个 continuation，直到主动声明只剩等待。
+显式等待交接由 Goal 自己执行 `auto-research goal set-status paused` 完成；“自己执行”指
+Agent 自主决定并调用 Auto Research 状态桥，模型本身没有原生 `thread/goal/set(paused)`
+工具。该 CLI 仅允许修改项目绑定的自身 Thread，并直接调用 App Server
+`thread/goal/set`，不经过 MCP 审批，也不复制 per-run 等待状态。启动实验本身不触发交接。
+Agent 可以经历任意多个 continuation，直到主动声明只剩等待。
 
-## 5. 状态机
+## 5. 最小状态与事实模型
 
-```mermaid
-stateDiagram-v2
-    [*] --> BOOTSTRAPPING
-    BOOTSTRAPPING --> GOAL_ACTIVATING
-    GOAL_ACTIVATING --> GOAL_RUNNING: automatic turn/started
-    GOAL_ACTIVATING --> GOAL_REPAIR_RUNNING: no automatic turn/started
-    GOAL_REPAIR_RUNNING --> GOAL_RUNNING: ordinary repair Turn
-    GOAL_REPAIR_RUNNING --> NEEDS_USER: repair Turn rejected
-    GOAL_RUNNING --> GOAL_TURN_COMPLETED: turn/completed
-    GOAL_TURN_COMPLETED --> EXPERIMENT_RUNNING_WITH_CONTINUATIONS: active run, no wait request
-    EXPERIMENT_RUNNING_WITH_CONTINUATIONS --> GOAL_RUNNING: Goal remains active
-    GOAL_TURN_COMPLETED --> EXPERIMENT_WAITING: explicit wait request
-    GOAL_TURN_COMPLETED --> COMPLETED: Goal complete
-    GOAL_TURN_COMPLETED --> GOAL_ACTIVATING: blocked, paused, or other non-active Goal
-    GOAL_TURN_COMPLETED --> NEEDS_USER: usageLimited or budgetLimited
-    EXPERIMENT_WAITING --> GOAL_ACTIVATING: terminal + set active
-    NEEDS_USER --> BOOTSTRAPPING: operator resume
-```
+Supervisor 的 `state.json` 只保存三个会改变恢复动作的控制状态：
 
-`GOAL_ACTIVATING` 的成功条件不是只读回 `active`，而是同一 daemon 发出新的
-`turn/started`。如果 120 秒内没有该执行证据，Supervisor 创建一个带明确原因和
-持久状态引用的普通 repair Turn；仅当这个 Turn 也无法创建时才进入 `NEEDS_USER`。
+| 状态 | 含义 | 恢复动作 |
+|---|---|---|
+| `OPEN` | Goal cycle 未结束，当前进程可运行也可因 paused/blocked 而退出 | 实时读取 App Server、registry 和 run events 决定动作 |
+| `NEEDS_USER` | Goal 自动推进暂停：repair Turn 无法建立，或遇到未知/额度状态 | Worker 仍照常启动、监控和收尾；修复后手动 `supervisor start/resume`，单次重试 Goal |
+| `COMPLETED` | native Goal 已完成 | 只能用显式 `supervisor restart` 创建新 cycle |
+
+`BOOTSTRAPPING`、`GOAL_RUNNING`、`EXPERIMENT_WAITING`、`GOAL_ACTIVATING` 等阶段不再
+持久化。它们都能从进程、App Server Goal/Turn、active registry 和 run event 推导，复制
+只会产生旧状态误导控制流。
+
+Run 自身仍只有 `SUBMITTED`、`RUNNING` 和 terminal event。终态交付进度不是额外状态机，
+而是 registry 上的事实字段：`terminal_injected_at` 只记录轻量通知成功。marker 保存
+尚未完成的 Worker ownership；run 已终态后无论通知是否成功都可删除。通知失败写入 run
+目录的诊断文件，但不阻断 Goal 唤醒；Codex 以 terminal event 和 run 目录为权威结果源。
+后续人工 `start/resume` 直接根据实时 Goal 状态恢复，不把 marker 当第二套唤醒控制面。
+多个终态在一次 reconciliation 中全部注入后只处理一次 Goal。
+
+Goal 状态始终以 App Server 实时读取为准：
+
+- `paused` 且实验终态已注入：无条件设置 `active`，不追溯暂停原因；
+- `blocked`：始终保持 blocked，实验终态只注入、不激活；
+- `active`：注入后继续由 native scheduler 处理；
+- `complete`：交付后控制器进入 `COMPLETED`；
+- `usageLimited`、`budgetLimited`：不自动轮询或恢复，进入 `NEEDS_USER`；结果已成功注入
+  后可以结束该 run 的 marker 责任。用户恢复额度后手动 `supervisor start/resume`，只
+  尝试一次设为 `active`，失败则重新进入 `NEEDS_USER`。
+- 未知状态：进入 `NEEDS_USER` 供人工诊断；结果已经成功注入时同样可以结束 marker，
+  用户修正真实 Goal 状态后手动重试。
+
+paused 激活成功后仍必须观察同一 daemon 的新 `turn/started`。120 秒内没有执行证据时，
+Supervisor 创建一个带明确原因的普通 repair Turn；仅当这个 Turn 也无法创建时进入
+`NEEDS_USER`。
 
 ## 6. 实验启动与显式等待协议
 
@@ -315,37 +316,77 @@ TODO，不能以 `danger-full-access` 绕过确认。
 `auto-research submit` 完成以下边界：
 
 1. 校验当前 Thread 与项目专用 Thread 一致。
-2. 持久化 run、active marker 和 Goal contract snapshot。
+2. 持久化 run、按 `run_id` 的 active registry entry 和 Goal contract snapshot。
 3. 将 Codex 生成的命令以 `SUBMITTED` 状态持久化；不创建 Worker 进程。
-4. marker 写入 `wait_requested=false`。
-5. 返回 `goal_pause.status=NOT_REQUESTED` 和 `continuation_allowed=true`。
+4. 返回 `goal_pause.status=NOT_REQUESTED` 和 `continuation_allowed=true`。
+5. 检查 Supervisor PID、进程启动时间与 `OPERATIONAL`；若无存活 Supervisor，自动启动同一 state root 的
+   Supervisor。
 
 Supervisor 是唯一 Worker 启动者：它观察到 `SUBMITTED` 后调用 Runner launch，随后
 持有并监控 detached Worker。Goal Turn、MCP server 和普通 Codex shell 都不得绕过
 Supervisor 直接启动长实验。
 
+提交可附带 advisory `gpu_ids` 和 `expected_artifacts`。Supervisor 不据此拒绝 Codex 动作，
+但 run provenance 能显示资源归属；Worker 将进程终态与 `artifact_validation.json` 分开，
+缺失 metrics 或预期产物作为证据交给 Codex，而不是混入进程退出状态。
+
+提交只保留执行所需的技术校验：command 非空、worktree 存在、timeout 为正数、Thread/cycle
+归属明确。worktree 可以位于项目目录之外，timeout 不设置任意七天上限，Codex 生成的 shell
+命令不经过 executable allowlist；这些研究与资源决策不属于 Supervisor。
+
 提交后 Agent 继续所有可并行工作。只有只剩等待时调用 `auto-research goal set-status paused`；
 该 CLI 校验调用者只能修改项目精确绑定的自身 Thread，并同步设置 Goal `paused`。Experiment MCP
 不参与该控制面，避免平台 MCP 审批取消影响 Goal 生命周期。
 
+`auto-research wait <run_id>` 是独立的同步观察入口：它只读取同一 durable terminal event，
+不修改 Goal、不启动 Worker，也不删除 registry 的终态交付责任。因此它与 Goal 状态桥
+并存不构成第二套 Goal control plane。它适合短时同步等待和人工诊断；长实验默认使用
+`goal set-status paused` 交还 Turn，由 Supervisor 独立监控并在终态后恢复 Goal。
+
 ## 7. 实验恢复协议
 
-Supervisor观察到 terminal event 后（成功、失败、超时、取消与 LOST 完全等价）：
+Supervisor观察到任一 terminal event 后（成功、失败、超时、取消与 LOST 完全等价）：
 
 1. 校验 run 的 `codex_thread_id`。
-2. 清除匹配的 `active_experiment.json`。
-3. 清空当前阶段的 `run_id`；最近一次终态只保留 `last_terminal_run_id`，完整结果仍从 run 目录读取。
-4. 用 `thread/inject_items` 写入不可信的终态 JSON、artifact path 和日志尾部。
-5. 无条件尝试 `thread/goal/set(active)`，把终态交给 Goal runtime 消费。
-6. 若 wake-up 被拒绝，保留终态与 wake-up error 到状态文件；不得保留 active marker
-   或停止对已启动 Worker 的监控。对于 `blocked`、`paused` 和未知非 active 状态，立即
-   尝试 `active`；若仍失败则创建普通 repair Turn。`usageLimited`、`budgetLimited`、认证
-   或 transport 使 repair Turn 也无法创建时，才进入 `NEEDS_USER`。
+2. 在 registry entry 记录终态交付进度；读取结果和取消操作不能删除该 entry。
+3. 用 `thread/inject_items` 尽力写入只含 `run_id`、`status`、`result_dir` 的轻量通知；
+   成功时记录 `terminal_injected_at`。metrics、artifact validation、错误和日志不进入
+   Thread 上下文，由 Codex 从 `result_dir` 主动读取。
+4. 批量读取实时 Goal：paused 才激活，blocked 不激活；不根据本地 marker 或历史原因分支。
+5. paused 激活成功后等待新的 `turn/started`，不能依据紧随其后的一次旧 `paused` 读取退出。
+6. 通知注入失败只写 `terminal_injection_error.json`，仍继续 paused/blocked/active/
+   complete 的对应动作并结束 marker；不会进入 `NEEDS_USER`。完整结果始终由 terminal
+   event 和 run 目录保证，不依赖 Thread 注入。其他 run 继续独立监控。
+7. Supervisor 启动时扫描 Thread root 下所有无终态的 `SUBMITTED/RUNNING` run，将缺失的
+   registry entry 补回；确认 Worker 已退出后写入 `LOST`。Worker 身份无法核验、run
+   元数据损坏或 child 清理无法确认时不得猜测终态，而是进入 repair/`NEEDS_USER`。
+8. `NEEDS_USER` 只停止没有新终态依据的 Goal continuation/repair 自动化，不停止 durable
+   run 的启动、监控、deadline reconciliation、终态注入和安全清理。若终态到达时实时
+   Goal 为 paused，仍按核心规则尝试一次激活；所有 active run 收尾后才退出。
+
+Worker 的 PID 与启动时间匹配但长期存活，不等于运行健康。Supervisor 同时读取实验的
+明确 deadline、heartbeat 和进程身份；超过 `timeout_s + event_grace_s` 后，即使 Worker
+仍存活也必须先核验并停止 child/Worker，确认清理完成后才提交 `TIMEOUT`。身份不明或清理
+失败时不写伪终态。
+
+### 容错与修复门槛
+
+本方案只把以下情况视为必须修复的控制面故障：
+
+- Supervisor 自行无限重启、无限激活或无限创建 continuation；
+- durable run、终态结果或 Goal 唤醒责任丢失，导致流程永久停滞；
+- Worker/child 仍存活，却已提交 `CANCELLED/LOST` 并释放 ownership；
+- 同一 run 被重复启动，或多个 Supervisor 同时取得相同控制权；
+- Supervisor 异常退出且错误无法交给 Codex 或人工恢复。
+
+不追求跨 App Server、文件系统和进程 side effect 的严格 exactly-once。一个残留请求造成
+一次额外激活/continuation，或幂等重试造成一次重复结果注入，可以接受；请求或 marker
+处理后必须收敛，不能自动反复发生。不得为消除这种单次重复增加新的 Supervisor 控制状态。
 
 ### 普通 Turn fallback
 
-实验终态后，Supervisor 先调用 `thread/goal/set(active)` 并验证返回的 Goal 状态确实为
-`active`。如果 App Server 保留 `blocked` 等非 active 状态或请求报错，当前实现会立即
+实验终态后，Supervisor 只对实时 `paused` 调用 `thread/goal/set(active)` 并验证返回状态。
+如果 App Server 拒绝 paused 激活或请求报错，当前实现会立即
 创建一个**窄范围、可审计的普通 repair Turn**，把 run id 和激活失败原因交给 Codex。
 
 `thread/goal/set(active)` 已成功、但 120 秒内仍未收到原生 `turn/started` 时，当前实现：
@@ -391,35 +432,50 @@ have since logged out or signed in to another account"。
 
 ## 8. 重启恢复
 
-Supervisor启动顺序同时区分 active run 和显式等待标记：
+Supervisor启动顺序以实时 Goal 和 durable run 事实为准：
 
-- active run 且 `wait_requested=false`：保持/恢复 Goal active，继续 continuation；
-  Supervisor 只在每个 Turn 终点读取 durable run 状态。
-- active run 且 `wait_requested=true`：先设置 `paused` 再 `thread/resume`，随后恢复
-  本地终态等待。
-- 不存在 active run：直接 `thread/resume`。active Goal 会由 daemon 自动续跑；
-  paused 初始 Goal由 Supervisor 显式设为 active。
+- 存在 active run：不根据 registry marker 改写 Goal；`active` 继续原生 continuation，
+  `paused/blocked` 保持原状态，同时 Supervisor 继续监控 Worker。
+- 不存在 active run：直接 `thread/resume`。已有 active Goal 由 daemon 自动续跑；
+  只有首次创建、尚无控制器状态的初始 paused Goal 由 Supervisor 激活。
 - 已有 in-progress Turn：从 resume/read 返回的 Turn 列表取得 ID并继续等待终态。
 - Goal complete：Supervisor结束。
-- blocked、paused 或其他非 active Goal：先 `set(active)`，失败则创建 repair Turn。
-- usageLimited/budgetLimited：进入 `NEEDS_USER`；这两个状态不能由 Supervisor 绕过。
+- blocked/paused Goal 且无 active run：保持原生状态并退出 monitor，不复制一份本地状态。
+- blocked Goal 即使实验结束也不自动恢复；paused Goal 只要实验结束就激活，不判断暂停原因。
+- usageLimited/budgetLimited：进入 `NEEDS_USER` 并退出，不轮询额度。额度恢复后由用户
+  手动 `supervisor start/resume`；该操作尝试一次 `thread/goal/set(active)`，失败则重新
+  进入 `NEEDS_USER`，不得自动循环。
+- 若限额错误发生时实时 Goal 仍显示 `paused`，手动 `start/resume` 同样只尝试一次
+  `active`；终态已经注入时不依赖旧 marker 才能恢复。
+- `NEEDS_USER` 时若仍存在 `SUBMITTED/RUNNING` run，Supervisor 保持运行直至全部终态；
+  该状态不得成为跳过 Worker reconciliation 的条件，也不覆盖终态对实时 paused Goal 的
+  一次唤醒规则。
+
+普通 Goal Turn 由 `supervisor.goal_turn_timeout_s` 提供无可观察进展上限，默认 1800 秒。
+Thread 中该 Turn 的结构化快照发生变化时刷新期限；健康但耗时较长的 Turn 不会仅因总运行
+时间超过 1800 秒而被中断。持续无进展后 Supervisor 先把 active Goal 暂停并中断精确
+Turn，再创建一次 repair Turn；repair Turn 自身持续无进展只中断并进入 `NEEDS_USER`，不得
+递归创建 repair。进程级 fatal repair 等待采用相同规则，并在等待期间继续 reconciliation
+durable runs。repair 失败只停止 Codex 自动修复；若仍有 active run，Supervisor 必须继续
+监控到全部终态。终态恢复创建的 repair Turn 必须重新接入同一个 watchdog，不能无人监管。
 
 ## 9. 持久文件
 
 | 文件 | 用途 |
 |---|---|
-| `<state-root>/codex_session.json` | `session` 命令创建或显式绑定、由 auto 模式以 adopted 方式接管的 Thread |
-| `<state-root>/supervisor_session.json` | auto 模式在没有已有绑定时创建的 Supervisor 专用 Thread 绑定 |
-| `<state-root>/supervisor/state.json` | monitor 阶段、Turn/run 引用和终态 run 引用；不复制 Goal、模型配置或完整终态结果，各自以 App Server、session/config 和 run 目录为事实源 |
-| `<state-root>/supervisor/active_experiment.json` | Supervisor 会话当前非终态 run |
-| `<state-root>/supervisor/goal_status_request.json` | sandboxed Goal 请求 Supervisor 代为执行 `thread/goal/set` 的一次性桥接请求 |
-| `<state-root>/supervisor/goal_status_ack.json` | 上述请求的宿主侧执行结果；用于确认 paused/complete 已真实生效 |
-| `<state-root>/supervisor/experiment_handoff.json` | `wait_for_experiment` 已暂停 Goal 的证据 |
-| `<state-root>/runs/<run_id>/...` | Worker 和终态事实 |
+| `<thread-root>/metadata.json` | 人类可读名称、项目与 Thread 归属；仅用于浏览和审计，不参与选路 |
+| `<thread-root>/supervisor_session.json` | Thread 与项目的精确绑定；创建后立即原子持久化 |
+| `<thread-root>/cycles/<cycle-id>.json` | 同一 Thread 上每轮 Goal 的目标与开始时间；历史 runs 不随 cycle 清空 |
+| `<thread-root>/supervisor/state.json` | 只保存 `OPEN`、`NEEDS_USER`、`COMPLETED` 及 repair Turn 身份；不保存运行阶段 |
+| `<thread-root>/supervisor/active_experiments.json` | 按 `run_id` 保存所有待启动、运行中及待完成终态交付的 run；不是并发限制 |
+| `<thread-root>/supervisor/goal_status_requests/<request-id>.json` | sandboxed Goal 请求 Supervisor 代为执行 `thread/goal/set` 的队列项 |
+| `<thread-root>/supervisor/goal_status_acks/<request-id>.json` | 对应 request id 的执行结果，避免并发请求互相覆盖 |
+| `<thread-root>/runs/<run_id>/...` | Worker 和终态事实 |
 
-Supervisor 不读取或恢复 legacy Desktop Listener 的 marker。兼容路径及其持久文件
-单独记录在 [Legacy Desktop Goal Wake Listener](LEGACY_DESKTOP_GOAL_WAKE_LISTENER.md)。
-每个 Supervisor 只有一个 active run，评估 campaign 仍需串行。
+其中 `<thread-root>` 恒等于 `research/supervisors/<thread-id>/`，不是配置参数。
+
+Supervisor 不限制 active run 数量。串行、并行和 GPU 分配属于 Codex/`GOAL.md` 的研究
+策略；Supervisor 逐 run 启动、监控、取消、交付终态。
 
 `state.json` schema 为 v3，实现只定义、读取和写入当前字段，不包含历史 schema 的
 迁移、清理或拒绝分支。
@@ -428,15 +484,36 @@ Supervisor 不读取或恢复 legacy Desktop Listener 的 marker。兼容路径�
 
 单元测试必须证明：
 
-- blocked/paused/未知非 active Goal 被自动激活；激活拒绝时创建 repair Turn；
+- 新建、adopt、restart、同 Thread 多 Goal cycle、重复启动、损坏绑定与并发 bootstrap
+  都只命中一个 canonical Thread root；
+
+- 无活动实验时，Goal Turn 自主 blocked/paused 后不会被自动激活；Supervisor 重启也
+  不得覆盖该状态；
+- 已启动 Worker 即使遇到 blocked/paused 仍监控到终态；paused 只激活一次，blocked 不激活；
+- 多个 run 可同时登记和启动；一个 run 的查询、取消或终态不能删除其他 run；
+- 终态激活已经创建 Goal Turn但持久 Goal 读取仍短暂为 paused 时，Supervisor 不得退出；
+- 提交时 Supervisor 已死亡会自动启动，并以 PID+start-time 和 `OPERATIONAL` 作为接管成功；
 - native `turn/started` 超时时创建 repair Turn；仅 repair Turn 也被拒绝时进入
   `NEEDS_USER`；
+- Goal Turn 持续无进展时会有界中断并只创建一个 repair Turn；可观察进展会刷新期限，
+  repair Turn 卡死不递归；
+- fatal repair 失败时已有 Worker 仍监控到终态；终态创建的 repair Turn 会重新接入
+  watchdog，Supervisor 不得提前退出；
 - paused Goal 激活后观察到 native `turn/started`；
-- run 终态后注入结果并重新 active；
+- run 终态后尽力注入轻量通知；注入失败仍恢复 paused Goal，blocked Goal保持 blocked；
+- usageLimited/budgetLimited 不自动轮询；恢复额度后手动 start/resume 能重新产生 Goal
+  continuation，失败只重试一次；
+- 终止 Worker/child 失败时不提交 `CANCELLED/LOST`，不释放 run ownership；
+- 缺失 registry entry 的 unfinished run 会被重新接管；Worker 身份无法核验或 run
+  元数据损坏时 fail closed，不能伪造 LOST；
+- Supervisor 异常退出、run/registry 提交中断和进程身份异常都不能留下永久无人处理的
+  `SUBMITTED/RUNNING` run；
+- `NEEDS_USER` 期间仍启动、监控并收尾 durable runs；新终态仍唤醒实时 paused Goal；
+- alive Worker 超过 deadline 时核验并清理 child/Worker 后写 `TIMEOUT`，清理失败不写终态；
 - 第二次 Goal continuation 能继续并完成；
 - Supervisor-owned run 不启动旧 Listener；
 - 启动 run 后至少允许两次 native continuation；
-- 显式 wait handoff 与 run/thread 精确绑定，且只有 handoff 后才暂停。
+- Goal 状态桥只修改精确绑定的自身 Thread，不向 registry 复制等待状态。
 
 真实 daemon smoke test 还需验证：
 

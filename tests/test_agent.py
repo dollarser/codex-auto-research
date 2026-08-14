@@ -22,64 +22,37 @@ from auto_research.config import load_config
 from auto_research.ledger import write_json_atomic
 from auto_research.mcp_config import register_mcp_config, render_mcp_config
 from auto_research.mcp_server import ExperimentService
+from auto_research.process_identity import process_matches
 from auto_research.research_session import (
     ResearchSessionError,
     ResearchSessionManager,
 )
+from auto_research.run_registry import add_active_run, list_active_runs
 from auto_research.runner import ExperimentRunner, finalize_run
-from auto_research.wake_listener import (
-    GoalBindingError,
-    GoalWakeListener,
-    recover_wake_listeners,
-)
+from auto_research.state_paths import thread_state_root
 
 
 def write_goal(project: Path) -> None:
+    project.joinpath("GOAL.md").write_text(
+        "# Goal\n\nMaximize score under the fixed evaluation protocol.\n",
+        encoding="utf-8",
+    )
+
+
+def write_managed_session(project: Path, thread_id: str) -> None:
     write_json_atomic(
-        project / "goal.json",
+        thread_state_root(project, thread_id) / "supervisor_session.json",
         {
-            "goal_id": "goal-test",
-            "statement": "maximize score",
-            "primary_metric": "score",
-            "direction": "maximize",
-            "search_space": {"editable_paths": ["src"], "sealed_paths": ["eval"]},
-            "constraints": {"max_wall_time_s": 60},
-            "hard_requirements": [],
-            "stopping": {"max_experiments": 5},
+            "schema_version": 2,
+            "project_root": str(project.resolve()),
+            "thread_id": thread_id,
+            "title": "Test research",
+            "objective": "Test objective",
+            "ownership": "adopted",
+            "setup_state": "ready",
+            "current_cycle_id": "cycle-test",
         },
     )
-
-
-def write_terminal_run(project: Path, run_id: str = "run-test-001") -> Path:
-    run_dir = project / "research" / "runs" / run_id
-    (run_dir / "events").mkdir(parents=True)
-    run = {
-        "run_id": run_id,
-        "idea_id": "idea-test",
-        "worktree": str(project),
-        "command": "python train.py",
-        "argv": ["python", "train.py"],
-        "timeout_s": 60,
-        "created_at": time.time(),
-        "status": "RUNNING",
-        "pause_goal_on_turn_end": False,
-    }
-    write_json_atomic(run_dir / "run.json", run)
-    write_json_atomic(run_dir / "metrics.json", {"score": 0.9})
-    finalize_run(
-        run_dir,
-        "completed.json",
-        {
-            "event": "RUN_COMPLETED",
-            "run_id": run_id,
-            "idea_id": "idea-test",
-            "status": "COMPLETED",
-            "return_code": 0,
-            "finished_at": time.time(),
-        },
-        run,
-    )
-    return run_dir
 
 
 class FakeAppServer:
@@ -198,7 +171,11 @@ class AgentTests(unittest.TestCase):
                 project, client_factory=lambda: client
             )
 
-            first = manager.prepare(create_thread=True, title="Dedicated Research")
+            first = manager.prepare(
+                create_thread=True,
+                creation_key="agent-idempotent",
+                title="Dedicated Research",
+            )
             second = manager.prepare(create_thread=True)
 
             self.assertTrue(first["created"])
@@ -210,7 +187,7 @@ class AgentTests(unittest.TestCase):
             )
             self.assertEqual(client.goals[first["thread_id"]]["status"], "paused")
             state = json.loads(
-                (project / "research" / "codex_session.json").read_text(
+                (thread_state_root(project, first["thread_id"]) / "supervisor_session.json").read_text(
                     encoding="utf-8"
                 )
             )
@@ -245,32 +222,35 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
-            state_path = project / "research" / "codex_session.json"
+            client = FakeSessionAppServer(project)
+            client.threads["thread-corrupt"] = {
+                "id": "thread-corrupt",
+                "cwd": str(project),
+            }
+            state_path = thread_state_root(project, "thread-corrupt") / "supervisor_session.json"
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text("{not-json", encoding="utf-8")
-            client = FakeSessionAppServer(project)
-
             with self.assertRaisesRegex(
                 ResearchSessionError, "refusing to create a duplicate"
             ):
                 ResearchSessionManager(
                     project, client_factory=lambda: client
-                ).prepare(create_thread=True)
+                ).prepare(thread_id="thread-corrupt")
             self.assertEqual(client.start_count, 0)
 
     def test_research_session_validates_objective_before_thread_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
-            project.joinpath("goal.json").write_text("{}", encoding="utf-8")
+            project.joinpath("GOAL.md").write_text("   \n", encoding="utf-8")
             client = FakeSessionAppServer(project)
 
-            with self.assertRaisesRegex(ResearchSessionError, "statement"):
+            with self.assertRaisesRegex(ResearchSessionError, "objective"):
                 ResearchSessionManager(
                     project, client_factory=lambda: client
-                ).prepare(create_thread=True)
+                ).prepare(create_thread=True, creation_key="invalid-objective")
             self.assertEqual(client.start_count, 0)
             self.assertFalse(
-                (project / "research" / "codex_session.json").exists()
+                thread_state_root(project, "thread-1").joinpath("supervisor_session.json").exists()
             )
 
     def test_research_session_rejects_thread_from_another_project(self):
@@ -295,18 +275,19 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
+            write_managed_session(project, "thread-supervisor")
             (project / "research").mkdir(exist_ok=True)
             (project / "research" / "config.toml").write_text(
-                "[listener]\nauto_wake=false\n",
+                "[supervisor]\nevent_poll_s=0.25\n",
                 encoding="utf-8",
             )
             write_json_atomic(
-                project / "research" / "supervisor" / "state.json",
+                thread_state_root(project, "thread-supervisor") / "supervisor" / "state.json",
                 {
                     "schema_version": 3,
                     "project_root": str(project.resolve()),
                     "thread_id": "thread-supervisor",
-                    "state": "GOAL_RUNNING",
+                    "state": "OPEN",
                 },
             )
             code = (
@@ -318,7 +299,13 @@ class AgentTests(unittest.TestCase):
             previous = sys.stdout
             sys.stdout = output
             try:
-                with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):
+                with (
+                    patch.dict(os.environ, {"CODEX_THREAD_ID": ""}),
+                    patch(
+                        "auto_research.mcp_server.ensure_supervisor_running",
+                        return_value={"status": "OPERATIONAL", "operational": True},
+                    ),
+                ):
                     exit_code = cli_main(
                         [
                             "submit",
@@ -339,7 +326,7 @@ class AgentTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertEqual(exit_code, 0)
             self.assertEqual(payload["status"], "SUBMITTED")
-            run = ExperimentRunner(project / "research" / "runs").get_run(
+            run = ExperimentRunner(thread_state_root(project, "thread-supervisor") / "runs").get_run(
                 payload["run_id"]
             )
             self.assertEqual(run["status"], "SUBMITTED")
@@ -350,43 +337,86 @@ class AgentTests(unittest.TestCase):
             root = Path(tmp)
             (root / "research").mkdir()
             (root / "research" / "config.toml").write_text(
-                "[listener]\nauto_wake=false\nreconnect_max_s=12\n"
-                "[experiment]\nuse_shell=false\n",
+                "[supervisor]\nevent_poll_s=0.5\ngoal_turn_timeout_s=123\n",
                 encoding="utf-8",
             )
-            previous = os.environ.get("AUTO_RESEARCH_RECONNECT_MAX_S")
-            os.environ["AUTO_RESEARCH_RECONNECT_MAX_S"] = "13"
+            previous = os.environ.get("AUTO_RESEARCH_EVENT_POLL_S")
+            os.environ["AUTO_RESEARCH_EVENT_POLL_S"] = "0.75"
             try:
                 config = load_config(root)
             finally:
                 if previous is None:
-                    os.environ.pop("AUTO_RESEARCH_RECONNECT_MAX_S", None)
+                    os.environ.pop("AUTO_RESEARCH_EVENT_POLL_S", None)
                 else:
-                    os.environ["AUTO_RESEARCH_RECONNECT_MAX_S"] = previous
-            self.assertFalse(config.auto_wake)
-            self.assertFalse(config.use_shell)
-            self.assertEqual(config.reconnect_max_s, 13)
+                    os.environ["AUTO_RESEARCH_EVENT_POLL_S"] = previous
+            self.assertEqual(config.event_poll_s, 0.75)
+            self.assertEqual(config.goal_turn_timeout_s, 123)
             self.assertEqual(config.codex_model, "gpt-5.6-terra")
             self.assertEqual(config.codex_approval_policy, "never")
             self.assertEqual(config.codex_sandbox, "workspace-write")
 
-    def test_legacy_desktop_listener_is_disabled_by_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = load_config(tmp)
-
-            self.assertFalse(config.auto_wake)
-
-    def test_cli_init_writes_legacy_listener_disabled(self):
+    def test_cli_init_writes_supervisor_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = io.StringIO()
             with patch("sys.stdout", output):
                 exit_code = cli_main(["init", tmp])
 
             self.assertEqual(exit_code, 0)
+            goal = (Path(tmp) / "GOAL.md").read_text(encoding="utf-8")
+            self.assertIn("# Goal", goal)
             config = (Path(tmp) / "research" / "config.toml").read_text(
                 encoding="utf-8"
             )
-            self.assertIn("auto_wake = false", config)
+            self.assertIn("[supervisor]", config)
+            self.assertNotIn("[listener]", config)
+
+    def test_cli_goal_pause_is_the_parameterized_experiment_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            write_managed_session(project, "thread-goal")
+            state_root = thread_state_root(project, "thread-goal")
+            write_json_atomic(
+                state_root / "supervisor" / "state.json",
+                {
+                    "schema_version": 3,
+                    "project_root": str(project.resolve()),
+                    "thread_id": "thread-goal",
+                    "state": "OPEN",
+                },
+            )
+            add_active_run(
+                state_root, run_id="run-one", thread_id="thread-goal"
+            )
+            add_active_run(
+                state_root, run_id="run-two", thread_id="thread-goal"
+            )
+            client = FakeAppServer(goal_status="active")
+            output = io.StringIO()
+            with (
+                patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-goal"}),
+                patch("auto_research.app_server.AppServerClient", return_value=client),
+                patch("sys.stdout", output),
+            ):
+                exit_code = cli_main(
+                    [
+                        "goal",
+                        "set-status",
+                        "paused",
+                        "--project",
+                        str(project),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn(("goal", "thread-goal", "paused"), client.calls)
+            markers = list_active_runs(state_root)
+            self.assertEqual(len(markers), 2)
+            self.assertTrue(
+                all(set(marker) == {"run_id", "thread_id"} for marker in markers)
+            )
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["bridge"], "direct")
+            self.assertNotIn("experiment_handoff", payload)
 
     def test_register_mcp_preserves_other_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,9 +444,9 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
-            service = ExperimentService(project)
+            service = ExperimentService(project, thread_id="thread-any", ensure_supervisor=False)
 
-            with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):
+            with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):  # noqa: SIM117
                 with self.assertRaisesRegex(ValueError, "managed Supervisor"):
                     service.submit_experiment(
                         "idea-one", ".", "python train.py", 30, thread_id="thread-any"
@@ -426,16 +456,17 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
+            write_managed_session(project, "thread-supervisor")
             write_json_atomic(
-                project / "research" / "supervisor" / "state.json",
+                thread_state_root(project, "thread-supervisor") / "supervisor" / "state.json",
                 {
                     "schema_version": 3,
                     "project_root": str(project.resolve()),
                     "thread_id": "thread-supervisor",
-                    "state": "GOAL_RUNNING",
+                    "state": "OPEN",
                 },
             )
-            service = ExperimentService(project)
+            service = ExperimentService(project, thread_id="thread-supervisor", ensure_supervisor=False)
 
             with (
                 patch.dict(os.environ, {"CODEX_THREAD_ID": ""}),
@@ -453,7 +484,6 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(result["scheduler"], "app_server_supervisor")
             self.assertEqual(result["worker_owner"], "supervisor")
             self.assertFalse(submit.call_args.kwargs["launch_worker"])
-            self.assertFalse(submit.call_args.kwargs["wake_enabled"])
             with (
                 patch.object(service.runner, "get_result", return_value=None),
                 patch.object(
@@ -466,27 +496,116 @@ class AgentTests(unittest.TestCase):
                     service.get_experiment_result("run-test")["status"],
                     "SUBMITTED",
                 )
-            marker = json.loads(
-                (project / "research" / "supervisor" / "active_experiment.json")
-                .read_text(encoding="utf-8")
+            marker = list_active_runs(thread_state_root(project, "thread-supervisor"))[0]
+            self.assertEqual(
+                marker,
+                {"run_id": "run-test", "thread_id": "thread-supervisor"},
             )
-            self.assertEqual(marker["run_id"], "run-test")
-            self.assertFalse(marker["wait_requested"])
+
+    def test_submit_accepts_external_worktree_long_timeout_and_shell_command(self):
+        with tempfile.TemporaryDirectory() as project_tmp, tempfile.TemporaryDirectory() as work_tmp:
+            project = Path(project_tmp)
+            worktree = Path(work_tmp)
+            write_goal(project)
+            write_managed_session(project, "thread-supervisor")
+            write_json_atomic(
+                thread_state_root(project, "thread-supervisor")
+                / "supervisor"
+                / "state.json",
+                {
+                    "schema_version": 3,
+                    "project_root": str(project.resolve()),
+                    "thread_id": "thread-supervisor",
+                    "state": "OPEN",
+                },
+            )
+            service = ExperimentService(
+                project, thread_id="thread-supervisor", ensure_supervisor=False
+            )
+
+            with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):
+                result = service.submit_experiment(
+                    "external-long-run",
+                    str(worktree),
+                    "bash -lc 'echo ready && true'",
+                    8 * 24 * 3600,
+                    thread_id="thread-supervisor",
+                )
+
+            run = service.runner.get_run(result["run_id"])
+            self.assertEqual(run["worktree"], str(worktree.resolve()))
+            self.assertEqual(run["timeout_s"], 8 * 24 * 3600)
+            self.assertTrue(run["shell"])
+
+    def test_submit_ensures_a_ready_supervisor_after_registry_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            write_goal(project)
+            write_managed_session(project, "thread-supervisor")
+            write_json_atomic(
+                thread_state_root(project, "thread-supervisor") / "supervisor" / "state.json",
+                {
+                    "schema_version": 3,
+                    "project_root": str(project.resolve()),
+                    "thread_id": "thread-supervisor",
+                    "state": "OPEN",
+                },
+            )
+            service = ExperimentService(project, thread_id="thread-supervisor")
+            with (
+                patch.dict(os.environ, {"CODEX_THREAD_ID": ""}),
+                patch.object(service.runner, "submit", return_value="run-test"),
+                patch(
+                    "auto_research.mcp_server.ensure_supervisor_running",
+                    return_value={"status": "OPERATIONAL", "pid": 123, "operational": True},
+                ) as ensure,
+            ):
+                result = service.submit_experiment(
+                    "idea-one",
+                    ".",
+                    "python train.py",
+                    30,
+                    thread_id="thread-supervisor",
+                )
+
+            ensure.assert_called_once()
+            self.assertEqual(result["supervisor"]["status"], "OPERATIONAL")
+            self.assertEqual(
+                list_active_runs(thread_state_root(project, "thread-supervisor"))[0]["run_id"], "run-test"
+            )
+
+    def test_submit_returns_durable_run_when_supervisor_needs_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            write_goal(project)
+            write_managed_session(project, "thread-supervisor")
+            service = ExperimentService(project, thread_id="thread-supervisor")
+
+            with (
+                patch.dict(os.environ, {"CODEX_THREAD_ID": ""}),
+                patch(
+                    "auto_research.mcp_server.ensure_supervisor_running",
+                    side_effect=RuntimeError("daemon unavailable"),
+                ),
+            ):
+                result = service.submit_experiment(
+                    "repairable",
+                    ".",
+                    "python train.py",
+                    30,
+                    thread_id="thread-supervisor",
+                )
+
+            self.assertEqual(result["status"], "SUBMITTED")
+            self.assertEqual(result["supervisor"]["status"], "REPAIR_PENDING")
+            run = service.runner.get_run(result["run_id"])
+            self.assertEqual(run["goal_cycle_id"], "cycle-test")
 
     def test_submit_rejects_thread_that_is_not_managed_by_supervisor(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
-            write_json_atomic(
-                project / "research" / "codex_session.json",
-                {
-                    "schema_version": 1,
-                    "project_root": str(project.resolve()),
-                    "thread_id": "thread-dedicated",
-                    "setup_state": "ready",
-                },
-            )
-            service = ExperimentService(project)
+            service = ExperimentService(project, thread_id="thread-other", ensure_supervisor=False)
             previous = os.environ.get("CODEX_THREAD_ID")
             os.environ["CODEX_THREAD_ID"] = "thread-other"
             try:
@@ -504,16 +623,17 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_goal(project)
+            write_managed_session(project, "t1")
             write_json_atomic(
-                project / "research" / "supervisor" / "state.json",
+                thread_state_root(project, "t1") / "supervisor" / "state.json",
                 {
                     "schema_version": 3,
                     "project_root": str(project.resolve()),
                     "thread_id": "t1",
-                    "state": "GOAL_RUNNING",
+                    "state": "OPEN",
                 },
             )
-            service = ExperimentService(project)
+            service = ExperimentService(project, thread_id="t1", ensure_supervisor=False)
             code = (
                 "import json,os,pathlib; "
                 "pathlib.Path(os.environ['AUTO_RESEARCH_RUN_DIR'],'metrics.json')"
@@ -542,6 +662,208 @@ class AgentTests(unittest.TestCase):
                 )
             self.assertEqual(first["run_id"], second["run_id"])
 
+    def test_idempotency_key_rejects_a_different_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "runs")
+            runner.submit(
+                "idea-one",
+                tmp,
+                "python first.py",
+                30,
+                idempotency_key="request-one",
+                launch_worker=False,
+            )
+
+            with self.assertRaisesRegex(ValueError, "different request"):
+                runner.submit(
+                    "idea-one",
+                    tmp,
+                    "python second.py",
+                    30,
+                    idempotency_key="request-one",
+                    launch_worker=False,
+                )
+
+    def test_finalize_run_preserves_latest_process_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-test"
+            (run_dir / "events").mkdir(parents=True)
+            stale = {"run_id": "run-test", "idea_id": "idea", "status": "RUNNING"}
+            write_json_atomic(
+                run_dir / "run.json",
+                {**stale, "worker_pid": 10, "child_pid": 20},
+            )
+
+            finalize_run(
+                run_dir,
+                "completed.json",
+                {"status": "COMPLETED", "run_id": "run-test"},
+                stale,
+            )
+
+            persisted = json.loads((run_dir / "run.json").read_text())
+            self.assertEqual(persisted["worker_pid"], 10)
+            self.assertEqual(persisted["child_pid"], 20)
+
+    def test_cancel_cleanup_failure_does_not_commit_terminal_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "runs")
+            run_id = runner.submit(
+                "cancel-failure", tmp, "python train.py", 30, launch_worker=False
+            )
+            run_dir = runner.runs_dir / run_id
+            run = runner.get_run(run_id)
+            write_json_atomic(
+                run_dir / "run.json",
+                {
+                    **run,
+                    "status": "RUNNING",
+                    "worker_pid": 42,
+                    "worker_pid_start_ticks": 123,
+                },
+            )
+
+            with (
+                patch(
+                    "auto_research.runner.terminate_process_group",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(RuntimeError, "did not stop all processes"),
+            ):
+                runner.cancel(run_id)
+
+            self.assertIsNone(runner.get_result(run_id))
+            self.assertEqual(runner.get_run(run_id)["status"], "RUNNING")
+            self.assertTrue((run_dir / "cancel.error.json").is_file())
+
+    def test_dead_worker_without_terminal_event_becomes_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "runs")
+            run_id = runner.submit(
+                "dead-worker", tmp, "python train.py", 30, launch_worker=False
+            )
+            run_dir = runner.runs_dir / run_id
+            run = runner.get_run(run_id)
+            write_json_atomic(
+                run_dir / "run.json",
+                {
+                    **run,
+                    "status": "RUNNING",
+                    "worker_pid": 2_000_000_000,
+                    "worker_pid_start_ticks": 1,
+                },
+            )
+
+            result = runner.reconcile_worker(run_id)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.status, "LOST")
+            self.assertTrue((run_dir / "events" / "lost.json").is_file())
+
+    def test_alive_worker_past_deadline_is_cleaned_and_times_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "runs")
+            run_id = runner.submit(
+                "hung-worker", tmp, "python train.py", 1, launch_worker=False
+            )
+            run_dir = runner.runs_dir / run_id
+            run = runner.get_run(run_id)
+            write_json_atomic(
+                run_dir / "run.json",
+                {
+                    **run,
+                    "status": "RUNNING",
+                    "worker_pid": 101,
+                    "worker_pid_start_ticks": 1001,
+                    "child_pid": 202,
+                    "child_pid_start_ticks": 2002,
+                },
+            )
+            write_json_atomic(
+                run_dir / "events" / "started.json",
+                {"run_id": run_id, "started_at": 1.0},
+            )
+            write_json_atomic(
+                run_dir / "heartbeat.json",
+                {"run_id": run_id, "worker_pid": 101, "timestamp": 1.0},
+            )
+
+            with (
+                patch("auto_research.runner.process_identity_state", return_value="alive"),
+                patch(
+                    "auto_research.runner.terminate_process_group", return_value=True
+                ) as terminate,
+            ):
+                result = runner.reconcile_worker(run_id, now=100.0)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.status, "TIMEOUT")
+            self.assertIn("heartbeat=stale", result.error)
+            self.assertEqual(terminate.call_count, 2)
+
+    def test_unverifiable_worker_identity_does_not_commit_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "runs")
+            run_id = runner.submit(
+                "unknown-worker", tmp, "python train.py", 30, launch_worker=False
+            )
+            run_dir = runner.runs_dir / run_id
+            run = runner.get_run(run_id)
+            write_json_atomic(run_dir / "run.json", {**run, "status": "RUNNING"})
+
+            with self.assertRaisesRegex(RuntimeError, "could not be verified"):
+                runner.reconcile_worker(run_id)
+
+            self.assertIsNone(runner.get_result(run_id))
+            self.assertEqual(runner.get_run(run_id)["status"], "RUNNING")
+            self.assertTrue((run_dir / "worker_identity.error.json").is_file())
+
+    def test_corrupt_unfinished_run_metadata_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "runs")
+            run_dir = runner.runs_dir / "run-corrupt"
+            run_dir.mkdir()
+            (run_dir / "run.json").write_text("{", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "Invalid run metadata"):
+                runner.list_unfinished(thread_id="thread-test")
+
+    def test_process_completion_and_artifact_validation_are_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "runs")
+            run_id = runner.submit("no-metrics", tmp, "true", 30)
+
+            result = runner.wait(run_id, poll_s=0.02)
+
+            self.assertEqual(result.status, "COMPLETED")
+            self.assertFalse(result.artifact_validation["valid"])
+            self.assertIn("metrics.json", result.artifact_validation["errors"][0])
+
+    def test_cancel_confirms_verified_worker_and_child_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "runs")
+            run_id = runner.submit("cancel", tmp, "sleep 30", 60)
+            deadline = time.monotonic() + 5
+            run = runner.get_run(run_id)
+            while not run.get("child_pid") and time.monotonic() < deadline:
+                time.sleep(0.02)
+                run = runner.get_run(run_id)
+
+            result = runner.cancel(run_id)
+
+            self.assertEqual(result.status, "CANCELLED")
+            latest = runner.get_run(run_id)
+            self.assertFalse(
+                process_matches(
+                    latest.get("child_pid"), latest.get("child_pid_start_ticks")
+                )
+            )
+            self.assertFalse(
+                process_matches(
+                    latest.get("worker_pid"), latest.get("worker_pid_start_ticks")
+                )
+            )
+
     def test_finalize_run_commits_only_one_terminal_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run-test"
@@ -561,220 +883,6 @@ class AgentTests(unittest.TestCase):
             )
             self.assertTrue(first)
             self.assertFalse(second)
-
-    def test_wake_listener_binds_explicit_thread_and_wakes_once(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project)
-            clients: list[FakeAppServer] = []
-
-            def factory():
-                client = FakeAppServer(goal_status="paused", thread_status="idle")
-                clients.append(client)
-                return client
-
-            listener = GoalWakeListener(
-                project,
-                run_dir.name,
-                thread_id="thread-current",
-                client_factory=factory,
-            )
-            state = listener.run()
-            self.assertEqual(state["state"], "ACTIVATED")
-            self.assertEqual(state["thread_id"], "thread-current")
-            wake_client = clients[-1]
-            self.assertIn(("goal", "thread-current", "active"), wake_client.calls)
-            self.assertFalse(any(call[0] == "resume" for call in wake_client.calls))
-            self.assertFalse(any(call[0] == "turn" for call in wake_client.calls))
-
-            # Durable ACTIVATED state makes a repeated event/recovery a no-op.
-            again = listener.run()
-            self.assertEqual(again["state"], "ACTIVATED")
-            self.assertEqual(len(clients), 2)
-
-    def test_wake_listener_does_not_duplicate_an_active_thread(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project)
-            clients: list[FakeAppServer] = []
-
-            def factory():
-                client = FakeAppServer(goal_status="active", thread_status="active")
-                clients.append(client)
-                return client
-
-            state = GoalWakeListener(
-                project,
-                run_dir.name,
-                thread_id="thread-current",
-                client_factory=factory,
-            ).run()
-            self.assertEqual(state["state"], "SKIPPED")
-            self.assertFalse(any(call[0] == "goal" for call in clients[-1].calls))
-
-    def test_wake_listener_reactivates_blocked_goal_after_terminal_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project)
-            client = FakeAppServer(goal_status="blocked")
-            listener = GoalWakeListener(
-                project,
-                run_dir.name,
-                thread_id="thread-current",
-                client_factory=lambda: client,
-            )
-
-            state = listener.run()
-
-            self.assertEqual(state["state"], "ACTIVATED")
-            self.assertIn(("goal", "thread-current", "active"), client.calls)
-
-    def test_listener_treats_blocked_as_managed_experiment_wait(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project)
-            run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-            run["pause_goal_on_turn_end"] = True
-            write_json_atomic(run_dir / "run.json", run)
-            client = FakeAppServer(goal_status="blocked")
-            listener = GoalWakeListener(
-                project,
-                run_dir.name,
-                thread_id="thread-current",
-                client_factory=lambda: client,
-            )
-
-            state = listener._pause_goal_after_current_turn("thread-current")
-
-            self.assertEqual(state["state"], "WAITING")
-            self.assertEqual(state["pause_mode"], "blocked_wait")
-
-    def test_listener_recovers_a_persisted_pause_boundary(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project)
-            run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-            run["pause_goal_on_turn_end"] = True
-            write_json_atomic(run_dir / "run.json", run)
-            write_json_atomic(
-                run_dir / "wake.json",
-                {
-                    "state": "PAUSE_BOUNDARY_DETECTED",
-                    "pause_boundary_detected_at": 123.0,
-                    "pause_baseline_tokens": 10,
-                },
-            )
-            client = FakeAppServer(
-                goal_reads=[{"status": "paused", "tokensUsed": 20}]
-            )
-            listener = GoalWakeListener(
-                project,
-                run_dir.name,
-                thread_id="thread-current",
-                client_factory=lambda: client,
-            )
-            state = listener._pause_goal_after_current_turn("thread-current")
-            self.assertEqual(state["state"], "WAITING")
-            self.assertEqual(state["pause_mode"], "turn_boundary_recovered")
-            self.assertEqual(state["pause_boundary_observed_at"], 123.0)
-
-    def test_listener_reasserts_pause_after_submitting_turn_finishes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project)
-            run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-            run["pause_goal_on_turn_end"] = True
-            write_json_atomic(run_dir / "run.json", run)
-            client = FakeAppServer(
-                goal_reads=[
-                    {"status": "active", "tokensUsed": 10, "updatedAt": 1},
-                    {"status": "active", "tokensUsed": 20, "updatedAt": 2},
-                ]
-            )
-            listener = GoalWakeListener(
-                project,
-                run_dir.name,
-                thread_id="thread-current",
-                client_factory=lambda: client,
-            )
-            state = listener._pause_goal_after_current_turn("thread-current")
-            self.assertEqual(state["state"], "WAITING")
-            self.assertEqual(state["pause_boundary_reason"], "usage_advanced")
-            goal_calls = [call for call in client.calls if call[0] == "goal"]
-            self.assertEqual(
-                goal_calls,
-                [
-                    ("goal", "thread-current", "paused"),
-                    ("goal", "thread-current", "paused"),
-                ],
-            )
-
-    def test_thread_discovery_prefers_recent_active_goal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project)
-            now = time.time()
-            client = FakeAppServer(
-                threads=[
-                    {"id": "thread-paused", "updatedAt": now - 5},
-                    {"id": "thread-active", "updatedAt": now - 10},
-                ],
-                goals={
-                    "thread-paused": {"status": "paused"},
-                    "thread-active": {"status": "active"},
-                },
-            )
-            listener = GoalWakeListener(
-                project,
-                run_dir.name,
-                client_factory=lambda: client,
-            )
-            thread_id = listener._discover_thread(client, now)
-            self.assertEqual(thread_id, "thread-active")
-
-    def test_thread_discovery_rejects_ambiguous_candidates(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project)
-            now = time.time()
-            client = FakeAppServer(
-                threads=[
-                    {"id": "thread-a", "updatedAt": now},
-                    {"id": "thread-b", "updatedAt": now},
-                ],
-                goals={
-                    "thread-a": {"status": "paused"},
-                    "thread-b": {"status": "paused"},
-                },
-            )
-            listener = GoalWakeListener(
-                project, run_dir.name, client_factory=lambda: client
-            )
-            with self.assertRaises(GoalBindingError):
-                listener._discover_thread(client, now)
-
-    def test_recover_wakes_ignores_pre_v3_historical_runs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            write_terminal_run(project, "run-historical-001")
-            with patch("auto_research.wake_listener.spawn_wake_listener") as spawn:
-                recovered = recover_wake_listeners(project)
-            self.assertEqual(recovered, [])
-            spawn.assert_not_called()
-
-    def test_recover_wakes_does_not_reenable_disabled_legacy_listener(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            run_dir = write_terminal_run(project, "run-legacy-001")
-            run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-            run.update({"runtime_version": 3, "wake_enabled": True})
-            write_json_atomic(run_dir / "run.json", run)
-
-            with patch("auto_research.wake_listener.spawn_wake_listener") as spawn:
-                recovered = recover_wake_listeners(project)
-
-            self.assertEqual(recovered, [])
-            spawn.assert_not_called()
 
     def test_app_server_list_threads_uses_exact_cwd_filter(self):
         stdin = io.StringIO()
@@ -947,8 +1055,6 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             config = SimpleNamespace(
-                use_shell=True,
-                allowed_executables=[],
                 worker_heartbeat_s=5.0,
             )
             runner = ExperimentRunner(project / "research" / "runs", config=config)

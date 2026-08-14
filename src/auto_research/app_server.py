@@ -37,7 +37,7 @@ class AppServerClient:
         cwd: str | Path,
         config: ResearchConfig | None = None,
         *,
-        client_name: str = "auto-research-goal-wake-listener",
+        client_name: str = "auto-research-app-server-client",
         client_version: str = "0.3.0",
         managed_daemon: bool = False,
         ensure_daemon: bool = True,
@@ -367,6 +367,16 @@ class AppServerClient:
         if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
             raise AppServerError("turn/start did not return a turn id")
         return turn
+
+    def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        """Interrupt one exact Turn and wait for App Server acknowledgement."""
+        self._response(
+            self._send(
+                "turn/interrupt",
+                {"threadId": thread_id, "turnId": turn_id},
+            ),
+            timeout_s=min(self.config.app_server_response_timeout_s, 10.0),
+        )
 
     @staticmethod
     def _notification_turn(message: dict[str, Any]) -> dict[str, Any] | None:
