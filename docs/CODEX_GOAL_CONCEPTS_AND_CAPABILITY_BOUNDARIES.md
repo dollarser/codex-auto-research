@@ -2,6 +2,11 @@
 
 > 结论日期：2026-08-11；本机验证版本：`codex-cli 0.144.5`，`goals stable true`。
 
+本文使用的 Thread、Turn、Item、Goal、continuation、daemon、connection、
+persisted/effective 及各层状态，统一定义见
+[Codex 术语与 Auto Research 状态边界](CODEX_TERMINOLOGY.md)。尤其注意：
+`Turn=inProgress`、`Goal=active`、`Supervisor=OPEN` 和 `Run=RUNNING` 属于四个不同对象。
+
 ## 1. 对象与职责
 
 | 对象 | 职责 |

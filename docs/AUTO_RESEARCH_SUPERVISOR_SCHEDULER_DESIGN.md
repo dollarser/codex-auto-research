@@ -1,5 +1,9 @@
 # Native App Server Goal Runtime + Experiment Supervisor
 
+阅读本文前先看 [Codex 术语与 Auto Research 状态边界](CODEX_TERMINOLOGY.md)。本文所有
+`active`、`paused`、`inProgress`、`OPEN`、`RUNNING` 等状态都必须结合所属对象理解，
+不得在 Turn、Goal、Supervisor 和 Experiment Run 之间互相推断。
+
 本文描述具体架构与流程。所有状态、恢复、错误处理和测试设计必须遵守
 [Auto Research 设计原则](DESIGN_PRINCIPLES.md)；若具体实现与设计原则冲突，以设计原则为准。
 

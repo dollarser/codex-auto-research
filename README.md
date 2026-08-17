@@ -7,6 +7,11 @@
 
 ## 架构
 
+本文涉及的 Thread、Turn、Item、Goal、continuation、daemon、connection、
+`inProgress`、persisted/effective 等 Codex 名词，统一见
+[Codex 术语与 Auto Research 状态边界](docs/CODEX_TERMINOLOGY.md)。阅读状态时必须带上
+对象名称；例如 `Turn=inProgress` 与 `Run=RUNNING` 不是同一件事。
+
 ```mermaid
 flowchart TD
     D["managed App Server daemon"] --> G["native Codex Goal runtime"]
